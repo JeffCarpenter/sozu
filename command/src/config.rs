@@ -676,6 +676,7 @@ pub struct FileClusterFrontendConfig {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    pub h2: Option<bool>,
 }
 
 impl FileClusterFrontendConfig {
@@ -761,6 +762,7 @@ impl FileClusterFrontendConfig {
             path,
             method: self.method.clone(),
             tags: self.tags.clone(),
+            h2: self.h2.unwrap_or(false),
         })
     }
 }
@@ -786,6 +788,7 @@ pub struct FileClusterConfig {
     pub frontends: Vec<FileClusterFrontendConfig>,
     pub backends: Vec<BackendConfig>,
     pub protocol: FileClusterProtocolConfig,
+    pub http_version: Option<u8>,
     pub sticky_session: Option<bool>,
     pub https_redirect: Option<bool>,
     #[serde(default)]
@@ -911,6 +914,7 @@ pub struct HttpFrontendConfig {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    pub h2: bool,
 }
 
 impl HttpFrontendConfig {
@@ -946,6 +950,7 @@ impl HttpFrontendConfig {
                     path: self.path.clone(),
                     method: self.method.clone(),
                     position: self.position.into(),
+                    h2: self.h2,
                     tags,
                 })
                 .into(),
@@ -960,6 +965,7 @@ impl HttpFrontendConfig {
                     path: self.path.clone(),
                     method: self.method.clone(),
                     position: self.position.into(),
+                    h2: self.h2,
                     tags,
                 })
                 .into(),
@@ -1295,13 +1301,13 @@ impl ConfigBuilder {
         Ok(())
     }
 
-    fn push_http_listener(&mut self, mut listener: ListenerBuilder) -> Result<(), ConfigError> {
+    fn push_http_listener(&mut self, listener: ListenerBuilder) -> Result<(), ConfigError> {
         let listener = listener.to_http(Some(&self.built))?;
         self.built.http_listeners.push(listener);
         Ok(())
     }
 
-    fn push_tcp_listener(&mut self, mut listener: ListenerBuilder) -> Result<(), ConfigError> {
+    fn push_tcp_listener(&mut self, listener: ListenerBuilder) -> Result<(), ConfigError> {
         let listener = listener.to_tcp(Some(&self.built))?;
         self.built.tcp_listeners.push(listener);
         Ok(())
