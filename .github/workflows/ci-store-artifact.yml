@@ -1,0 +1,31 @@
+name: "CI (Store Artifacts)"
+on: [ workflow_dispatch, push, pull_request ]
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Checkout sources
+        uses: actions/checkout@v2
+      - name: Install rust (stable)
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+      - name: Build
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+      - name: Test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --verbose
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: release-artifact
+          path: target/release/
