@@ -3,6 +3,7 @@ use std::{
     env,
     fs::File,
     io::{ErrorKind, Read},
+    path::PathBuf,
 };
 
 use mio::Token;
@@ -121,6 +122,9 @@ impl Server {
                 })
                 .into(),
             ),
+            RequestType::ListFrontends(filters) => {
+                Some(ContentType::FrontendList(self.state.list_frontends(filters)).into())
+            }
             _ => None,
         }
     }
@@ -195,18 +199,35 @@ fn list_listeners(server: &mut Server, client: &mut ClientSession) {
 }
 
 fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
-    debug!("saving state to file {}", path);
-    let mut file = match File::create(path) {
+    let mut path = PathBuf::from(path);
+    if path.is_relative() {
+        match std::env::current_dir() {
+            Ok(cwd) => path = cwd.join(path),
+            Err(error) => {
+                client.finish_failure(format!("Cannot get Sōzu working directory: {error}",));
+                return;
+            }
+        }
+    }
+
+    debug!("saving state to file {}", &path.display());
+    let mut file = match File::create(&path) {
         Ok(file) => file,
         Err(error) => {
-            client.finish_failure(format!("Cannot create file at path {path}: {error}"));
+            client.finish_failure(format!(
+                "Cannot create file at path {}: {error}",
+                path.display()
+            ));
             return;
         }
     };
 
     match server.state.write_requests_to_file(&mut file) {
         Ok(counter) => {
-            client.finish_ok(format!("Saved {counter} config messages to {path}"));
+            client.finish_ok(format!(
+                "Saved {counter} config messages to {}",
+                &path.display()
+            ));
         }
         Err(error) => {
             client.finish_failure(format!("Failed writing state to file: {error}"));
@@ -255,7 +276,6 @@ fn subscribe_client_to_events(server: &mut Server, client: &mut ClientSession) {
 #[derive(Debug)]
 pub struct QueryClustersTask {
     pub client_token: Token,
-    pub request_type: RequestType,
     pub gatherer: DefaultGatherer,
     main_process_response: Option<ResponseContent>,
 }
@@ -273,7 +293,6 @@ pub fn query_clusters(
             client_token: client.token,
             gatherer: DefaultGatherer::default(),
             main_process_response: server.query_main(request_content.clone()),
-            request_type: request_content,
         }),
         Timeout::Default,
         None,
@@ -532,7 +551,7 @@ impl GatheringTask for QueryMetricsTask {
 
     fn on_finish(
         self: Box<Self>,
-        _server: &mut Server,
+        server: &mut Server,
         client: &mut OptionalClient,
         _timed_out: bool,
     ) {
@@ -555,6 +574,11 @@ impl GatheringTask for QueryMetricsTask {
                     summed_cluster_metrics.append(&mut listed_cluster_metrics.clone());
                 }
             }
+            summed_proxy_metrics.sort();
+            summed_cluster_metrics.sort();
+            summed_proxy_metrics.dedup();
+            summed_cluster_metrics.dedup();
+
             return client.finish_ok_with_content(
                 ContentType::AvailableMetrics(AvailableMetrics {
                     proxy_metrics: summed_proxy_metrics,
@@ -579,12 +603,19 @@ impl GatheringTask for QueryMetricsTask {
             )
             .collect();
 
+        let mut aggregated_metrics = AggregatedMetrics {
+            main: main_metrics,
+            clusters: BTreeMap::new(),
+            workers: workers_metrics,
+            proxying: BTreeMap::new(),
+        };
+
+        if !self.options.workers && server.workers.len() > 1 {
+            aggregated_metrics.merge_metrics();
+        }
+
         client.finish_ok_with_content(
-            ContentType::Metrics(AggregatedMetrics {
-                main: main_metrics,
-                workers: workers_metrics,
-            })
-            .into(),
+            ContentType::Metrics(aggregated_metrics).into(),
             "Successfully aggregated all metrics",
         );
     }

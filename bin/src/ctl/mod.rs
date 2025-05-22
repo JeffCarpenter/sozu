@@ -7,7 +7,7 @@ use sozu_command_lib::{
     certificate::CertificateError,
     channel::{Channel, ChannelError},
     config::{Config, ConfigError},
-    logging::setup_logging_with_config,
+    logging::{setup_logging_with_config, LogError},
     proto::{
         command::{Request, Response},
         DisplayError,
@@ -53,6 +53,10 @@ pub enum CtlError {
     NeedClusterDomain,
     #[error("wrong response from Sōzu: {0:?}")]
     WrongResponse(Response),
+    #[error("could not setup the logger: {0}")]
+    SetupLogging(LogError),
+    #[error("could not resolve path for {0} : {1}")]
+    ResolvePath(String, std::io::Error),
 }
 
 pub struct CommandManager {
@@ -70,7 +74,7 @@ pub fn ctl(args: cli::Args) -> Result<(), CtlError> {
 
     // prevent logging for json responses for a clean output
     if !args.json {
-        setup_logging_with_config(&config, "CTL");
+        setup_logging_with_config(&config, "CTL").map_err(CtlError::SetupLogging)?;
     }
 
     // If the command is `config check` then exit because if we are here, the configuration is valid
@@ -82,25 +86,27 @@ pub fn ctl(args: cli::Args) -> Result<(), CtlError> {
         std::process::exit(0);
     }
 
-    let channel = create_channel(&config)?;
-
     let timeout = Duration::from_millis(args.timeout.unwrap_or(config.ctl_command_timeout));
     if !args.json {
         debug!("applying timeout {:?}", timeout);
     }
 
-    let mut command_manager = CommandManager {
-        channel,
-        timeout,
-        config,
-        json: args.json,
-    };
+    let mut command_manager = CommandManager::new(config, timeout, args.json)?;
 
     command_manager.handle_command(args.cmd)
 }
 
 impl CommandManager {
-    fn handle_command(&mut self, command: SubCmd) -> Result<(), CtlError> {
+    pub fn new(config: Config, timeout: Duration, json: bool) -> Result<Self, CtlError> {
+        Ok(Self {
+            channel: create_channel(&config)?,
+            timeout,
+            config,
+            json,
+        })
+    }
+
+    pub fn handle_command(&mut self, command: SubCmd) -> Result<(), CtlError> {
         debug!("Executing command {:?}", command);
         match command {
             SubCmd::Shutdown { hard } => {
@@ -123,7 +129,16 @@ impl CommandManager {
                     clusters,
                     backends,
                     no_clusters,
-                } => self.get_metrics(list, refresh, names, clusters, backends, no_clusters),
+                    workers,
+                } => self.get_metrics(
+                    list,
+                    refresh,
+                    names,
+                    clusters,
+                    backends,
+                    no_clusters,
+                    workers,
+                ),
                 _ => self.configure_metrics(cmd),
             },
             SubCmd::Logging { filter } => self.logging_filter(filter),

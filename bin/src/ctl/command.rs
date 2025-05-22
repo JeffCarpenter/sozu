@@ -46,6 +46,12 @@ impl CommandManager {
                     if !self.json {
                         debug!("Processing: {}", response.message);
                     }
+                    if let Some(ResponseContent {
+                        content_type: Some(ContentType::Event(event)),
+                    }) = response.content
+                    {
+                        info!("{}, {}", response.message, event);
+                    }
                 }
                 ResponseStatus::Failure => return Err(CtlError::Failure(response.message)),
                 ResponseStatus::Ok => return Ok(response),
@@ -79,6 +85,7 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
         no_clusters: bool,
+        workers: bool,
     ) -> Result<(), CtlError> {
         let request: Request = RequestType::QueryMetrics(QueryMetricsOptions {
             list,
@@ -86,6 +93,7 @@ impl CommandManager {
             backend_ids,
             metric_names,
             no_clusters,
+            workers,
         })
         .into();
 
@@ -154,7 +162,11 @@ impl CommandManager {
             let config = self.config.clone();
 
             upgrade_jobs.push(std::thread::spawn(move || {
-                setup_logging_with_config(&config, &format!("UPGRADE-WRK-{}", worker.id));
+                if let Err(e) =
+                    setup_logging_with_config(&config, &format!("UPGRADE-WRK-{}", worker.id))
+                {
+                    error!("Could not setup logging: {}", e);
+                }
 
                 info!("creating channel to upgrade worker {}", worker.id);
                 let channel = match create_channel(&config) {

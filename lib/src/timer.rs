@@ -7,7 +7,6 @@ use std::{
     fmt::Display,
     iter,
     time::{Duration, Instant},
-    u64, usize,
 };
 
 use mio::Token;
@@ -639,10 +638,7 @@ mod test {
         let mut t = timer();
 
         t.set_timeout_at(Duration::from_millis(100), "a");
-        t.set_timeout_at(
-            Duration::from_millis((100 + TICK * SLOTS as u64) as u64),
-            "b",
-        );
+        t.set_timeout_at(Duration::from_millis(100 + TICK * SLOTS as u64), "b");
 
         let mut tick = ms_to_tick(&t, 100);
         assert_eq!(Some("a"), t.poll_to(tick));

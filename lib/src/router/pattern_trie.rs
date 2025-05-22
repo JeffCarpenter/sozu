@@ -34,7 +34,7 @@ fn find_last_slash(input: &[u8]) -> Option<usize> {
 /// A leaf node (leftmost label) can be a wildcard, a regex pattern or a plain string.
 /// Leaves also store a value associated with the complete domain.
 /// For Sozu it is a list of (PathRule, MethodRule, ClusterId). See the Router strucure.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TrieNode<V> {
     key_value: Option<KeyValue<Key, V>>,
     wildcard: Option<KeyValue<Key, V>>,
@@ -556,11 +556,11 @@ mod tests {
         );
         root.print();
         assert_eq!(
-            root.domain_lookup(&b"www.sozu.com".to_vec(), false),
+            root.domain_lookup(b"www.sozu.com".as_ref(), false),
             Some(&(b"www./.*/.com".to_vec(), 1))
         );
         assert_eq!(
-            root.domain_lookup(&b"www.doc.sozu.com".to_vec(), false),
+            root.domain_lookup(b"www.doc.sozu.com".as_ref(), false),
             Some(&(b"www.doc./.*/.com".to_vec(), 2))
         );
 
@@ -569,9 +569,9 @@ mod tests {
             RemoveResult::Ok
         );
         root.print();
-        assert_eq!(root.domain_lookup(&b"www.sozu.com".to_vec(), false), None);
+        assert_eq!(root.domain_lookup(b"www.sozu.com".as_ref(), false), None);
         assert_eq!(
-            root.domain_lookup(&b"www.doc.sozu.com".to_vec(), false),
+            root.domain_lookup(b"www.doc.sozu.com".as_ref(), false),
             Some(&(b"www.doc./.*/.com".to_vec(), 2))
         );
     }

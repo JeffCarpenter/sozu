@@ -226,7 +226,7 @@
 //! };
 //!
 //! fn main() -> anyhow::Result<()> {
-//!     setup_default_logging(true, "info", "EXAMPLE");
+//!     setup_default_logging(true, "info", "EXAMPLE").with_context(|| "could not setup logging")?;
 //!
 //!     info!("starting up");
 //!
@@ -339,7 +339,7 @@ pub mod https;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
-    fmt,
+    fmt::{self, Display, Formatter},
     net::SocketAddr,
     rc::Rc,
     str,
@@ -850,6 +850,26 @@ pub struct Readiness {
     pub interest: Ready,
 }
 
+impl Display for Readiness {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let i = &mut [b'-'; 4];
+        let r = &mut [b'-'; 4];
+        let mixed = &mut [b'-'; 4];
+
+        display_ready(i, self.interest);
+        display_ready(r, self.event);
+        display_ready(mixed, self.interest & self.event);
+
+        write!(
+            f,
+            "I({:?})&R({:?})=M({:?})",
+            String::from_utf8_lossy(i),
+            String::from_utf8_lossy(r),
+            String::from_utf8_lossy(mixed)
+        )
+    }
+}
+
 impl Default for Readiness {
     fn default() -> Self {
         Self::new()
@@ -1006,7 +1026,8 @@ impl SessionMetrics {
         }
     }
 
-    pub fn response_time(&self) -> Duration {
+    /// time elapsed since the beginning of the session
+    pub fn request_time(&self) -> Duration {
         match self.start {
             Some(start) => Instant::now() - start,
             None => Duration::from_secs(0),
@@ -1041,14 +1062,14 @@ impl SessionMetrics {
     }
 
     pub fn register_end_of_session(&self, context: &LogContext) {
-        let response_time = self.response_time();
+        let request_time = self.request_time();
         let service_time = self.service_time();
 
         if let Some(cluster_id) = context.cluster_id {
-            time!("response_time", cluster_id, response_time.as_millis());
+            time!("request_time", cluster_id, request_time.as_millis());
             time!("service_time", cluster_id, service_time.as_millis());
         }
-        time!("response_time", response_time.as_millis());
+        time!("request_time", request_time.as_millis());
         time!("service_time", service_time.as_millis());
 
         if let Some(backend_id) = self.backend_id.as_ref() {

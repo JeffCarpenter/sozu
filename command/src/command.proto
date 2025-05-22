@@ -441,6 +441,8 @@ message QueryMetricsOptions {
     repeated string metric_names = 4;
     // query only worker and main process metrics (no cluster metrics)
     required bool no_clusters = 5;
+    // display metrics of each worker, without flattening (takes more space)
+    required bool workers = 6;
 }
 
 // options to configure metrics collection
@@ -522,6 +524,7 @@ message ClusterInformation {
     repeated AddBackend backends = 5;
 }
 
+// an event produced by a worker to notify about backends status
 message Event {
     required EventKind kind = 1;
     optional string cluster_id = 2;
@@ -575,8 +578,18 @@ message AvailableMetrics {
 
 // Aggregated metrics of main process & workers
 message AggregatedMetrics {
+    // metrics about the main process.
+    // metric_name -> metric_value
     map<string, FilteredMetrics> main = 1;
+    // details of worker metrics, with clusters and backends.
+    // worker_id -> worker_metrics
     map<string, WorkerMetrics> workers = 2;
+    // if present, contains metrics of clusters and their backends, merged across all workers.
+    // cluster_id -> cluster_metrics
+    map<string, ClusterMetrics> clusters = 3;
+    // if present, proxying metrics, merged accross all workers.
+    // metric_name -> metric_value
+    map<string, FilteredMetrics> proxying = 4;
 }
 
 // All metrics of a worker: proxy and clusters
@@ -592,7 +605,7 @@ message WorkerMetrics {
 message ClusterMetrics {
     // metric name -> metric value
     map<string, FilteredMetrics> cluster = 1;
-    // backend_id -> (metric name-> metric value)
+    // list of backends with their metrics
     repeated BackendMetrics backends = 2;
 }
 
@@ -601,13 +614,18 @@ message BackendMetrics {
     map<string, FilteredMetrics> metrics = 2;
 }
 
+// A metric, in a "filtered" format, which means: sendable to outside programs.
 message FilteredMetrics {
     oneof inner {
+        // increases or decrease depending on the state
         uint64 gauge = 1;
+        // increases only
         int64 count = 2;
+        // milliseconds
         uint64 time = 3;
         Percentiles percentiles = 4;
         FilteredTimeSerie time_serie = 5;
+        FilteredHistogram histogram = 6;
     }
 }
 
@@ -616,7 +634,6 @@ message FilteredTimeSerie {
     repeated uint32 last_minute = 2;
     repeated uint32 last_hour = 3;
 }
-
 
 message Percentiles {
     required uint64 samples = 1;
@@ -628,6 +645,20 @@ message Percentiles {
     required uint64 p_99_999 = 7;
     required uint64 p_100 = 8;
     required uint64 sum = 9;
+}
+
+// a histogram meant to be translated to prometheus
+message FilteredHistogram {
+    required uint64 sum = 1;
+    required uint64 count = 2;
+    repeated Bucket buckets = 3;
+}
+
+// a prometheus histogram bucket
+message Bucket {
+    required uint64 count = 1;
+    // upper range of the bucket (le = less or equal)
+    required uint64 le = 2;
 }
 
 message RequestCounts {
@@ -744,8 +775,6 @@ message ProtobufAccessLog {
     optional uint64 client_rtt = 9;
     // round trip time for the backend (microseconds)
     optional uint64 server_rtt = 10;
-    // time for the backend to respond (microseconds)
-    required uint64 response_time = 12;
     // time spent on a session (microseconds)
     required uint64 service_time = 13;
     // number of bytes received from the client
@@ -760,6 +789,12 @@ message ProtobufAccessLog {
     required string tag = 18;
     // POSIX timestamp, nanoseconds
     required Uint128 time = 19;
+    // Entire time between first byte received and last byte of the response.
+    // If a request ends abruptly before the last byte is transmitted,
+    // the `request_time` produced is the time elapsed since the first byte received.
+    optional uint64 request_time = 20;
+    // time for the backend to respond (microseconds)
+    optional uint64 response_time = 21;
 }
 
 message ProtobufEndpoint {

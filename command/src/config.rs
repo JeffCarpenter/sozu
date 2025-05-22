@@ -172,6 +172,9 @@ pub const MAX_LOOP_ITERATIONS: usize = 100000;
 /// with little influence on performance. Defaults to 4.
 pub const DEFAULT_SEND_TLS_13_TICKETS: u64 = 4;
 
+/// for both logs and access logs
+pub const DEFAULT_LOG_TARGET: &str = "stdout";
+
 #[derive(Debug)]
 pub enum IncompatibilityKind {
     PublicAddress,
@@ -905,10 +908,7 @@ impl HttpFrontendConfig {
     pub fn generate_requests(&self, cluster_id: &str) -> Vec<Request> {
         let mut v = Vec::new();
 
-        let tags = match self.tags.clone() {
-            Some(tags) => tags,
-            None => BTreeMap::new(),
-        };
+        let tags = self.tags.clone().unwrap_or_default();
 
         if self.key.is_some() && self.certificate.is_some() {
             v.push(
@@ -919,7 +919,11 @@ impl HttpFrontendConfig {
                         certificate: self.certificate.clone().unwrap(),
                         certificate_chain: self.certificate_chain.clone().unwrap_or_default(),
                         versions: self.tls_versions.iter().map(|v| *v as i32).collect(),
-                        names: vec![self.hostname.clone()],
+                        // This field is used to override the certificate subject and san, we should not set it when
+                        // loading the configuration, as we may provide a wildcard certificate for a specific domain.
+                        // As a result, we will reject legit traffic for others domains as the certificate resolver will
+                        // not load twice the same certificate and then do not register the certificate for others domains.
+                        names: vec![],
                     },
                     expired_at: None,
                 })
@@ -1360,14 +1364,16 @@ impl ConfigBuilder {
                                         })
                                     {
                                         //println!("using listener certificate for {:}", frontend.address);
-                                        frontend.certificate = https_listener.certificate.clone();
+                                        frontend
+                                            .certificate
+                                            .clone_from(&https_listener.certificate);
                                         frontend.certificate_chain =
                                             Some(https_listener.certificate_chain.clone());
-                                        frontend.key = https_listener.key.clone();
+                                        frontend.key.clone_from(&https_listener.key);
                                     }
                                     if frontend.certificate.is_none() {
-                                        debug!("known addresses: {:#?}", self.known_addresses);
-                                        debug!("frontend: {:#?}", frontend);
+                                        debug!("known addresses: {:?}", self.known_addresses);
+                                        debug!("frontend: {:?}", frontend);
                                         return Err(ConfigError::WrongFrontendProtocol(
                                             ListenerProtocol::Https,
                                         ));
@@ -1577,7 +1583,7 @@ impl Config {
         for listener in &self.tcp_listeners {
             v.push(WorkerRequest {
                 id: format!("CONFIG-{count}"),
-                content: RequestType::AddTcpListener(listener.clone()).into(),
+                content: RequestType::AddTcpListener(*listener).into(),
             });
             count += 1;
         }
@@ -1598,7 +1604,7 @@ impl Config {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
                     content: RequestType::ActivateListener(ActivateListener {
-                        address: listener.address.clone(),
+                        address: listener.address,
                         proxy: ListenerType::Http.into(),
                         from_scm: false,
                     })
@@ -1611,7 +1617,7 @@ impl Config {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
                     content: RequestType::ActivateListener(ActivateListener {
-                        address: listener.address.clone(),
+                        address: listener.address,
                         proxy: ListenerType::Https.into(),
                         from_scm: false,
                     })
@@ -1624,7 +1630,7 @@ impl Config {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
                     content: RequestType::ActivateListener(ActivateListener {
-                        address: listener.address.clone(),
+                        address: listener.address,
                         proxy: ListenerType::Tcp.into(),
                         from_scm: false,
                     })

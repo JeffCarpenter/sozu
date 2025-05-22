@@ -4,7 +4,7 @@ use std::{
     fmt::Arguments,
     fs::{File, OpenOptions},
     io::{stdout, Error as IoError, ErrorKind as IoErrorKind, Stdout, Write},
-    net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{SocketAddr, TcpStream, UdpSocket},
     ops::{Deref, DerefMut},
     path::Path,
     str::FromStr,
@@ -12,12 +12,12 @@ use std::{
 
 use mio::net::UnixDatagram;
 use prost::{encoding::encoded_len_varint, Message};
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
 
 use crate::{
-    config::Config,
-    logging::{LogDuration, LogMessage, RequestRecord},
+    config::{Config, DEFAULT_LOG_TARGET},
+    logging::{LogDuration, LogError, LogMessage, RequestRecord},
     proto::command::ProtobufAccessLogFormat,
+    writer::MultiLineWriter,
     AsString,
 };
 
@@ -56,12 +56,15 @@ impl From<&Option<AccessLogFormat>> for ProtobufAccessLogFormat {
 }
 
 pub struct InnerLogger {
-    version: u8,
     directives: Vec<LogDirective>,
     backend: LoggerBackend,
+    /// inherited from the config's `log_target`, used to revive the backend
+    log_target: String,
     pub colored: bool,
     /// target of the access logs
     access_backend: Option<LoggerBackend>,
+    /// used to revive the backend for access logs
+    access_logs_target: Option<String>,
     /// how to format the access logs
     access_format: AccessLogFormat,
     access_colored: bool,
@@ -93,14 +96,15 @@ impl Default for Logger {
     fn default() -> Self {
         Self {
             inner: InnerLogger {
-                version: 1, // all call site start with a version of 0
                 directives: vec![LogDirective {
                     name: None,
                     level: LogLevelFilter::Error,
                 }],
                 backend: LoggerBackend::Stdout(stdout()),
+                log_target: DEFAULT_LOG_TARGET.to_string(),
                 colored: false,
                 access_backend: None,
+                access_logs_target: None,
                 access_format: AccessLogFormat::Ascii,
                 access_colored: false,
                 buffer: LoggerBuffer(Vec::with_capacity(4096)),
@@ -120,12 +124,18 @@ impl Logger {
     pub fn init(
         tag: String,
         spec: &str,
-        backend: LoggerBackend,
+        log_target: &str,
         colored: bool,
-        access_backend: Option<LoggerBackend>,
+        access_logs_target: Option<&str>,
         access_format: Option<AccessLogFormat>,
         access_colored: Option<bool>,
-    ) {
+    ) -> Result<(), LogError> {
+        println!("Logs will be sent to {log_target}");
+        let backend = target_or_default(log_target);
+
+        println!("Access logs will be sent to {access_logs_target:?}");
+        let access_backend = access_logs_target.map(target_to_backend).transpose()?;
+
         let (directives, _errors) = parse_logging_spec(spec);
         LOGGER.with(|logger| {
             let mut logger = logger.borrow_mut();
@@ -142,7 +152,9 @@ impl Logger {
                     _ => false,
                 };
                 logger.backend = backend;
+                logger.log_target = log_target.to_owned();
                 logger.access_backend = access_backend;
+                logger.access_logs_target = access_logs_target.map(ToOwned::to_owned);
                 logger.access_format = access_format.unwrap_or(AccessLogFormat::Ascii);
                 logger.tag = tag;
                 logger.pid = unsafe { libc::getpid() };
@@ -154,13 +166,10 @@ impl Logger {
                 log::set_max_level(log::LevelFilter::Info);
             }
         });
+        Ok(())
     }
 
     pub fn set_directives(&mut self, directives: Vec<LogDirective>) {
-        self.version += 1;
-        if self.version >= LOG_LINE_ENABLED {
-            self.version = 0;
-        }
         self.directives = directives;
     }
 
@@ -223,7 +232,7 @@ impl InnerLogger {
     /// write an access log to the proper logging target
     ///
     /// Protobuf access logs are written with a prost length delimiter before, and 2 empty bytes after
-    pub fn log_access(&mut self, log: RequestRecord) {
+    pub fn log_access(&mut self, log: RequestRecord) -> bool {
         let backend = self.access_backend.as_mut().unwrap_or(&mut self.backend);
 
         let io_result = match self.access_format {
@@ -245,7 +254,7 @@ impl InnerLogger {
                     match backend {
                         LoggerBackend::Stdout(stdout) => {
                             let _ = stdout.write(bytes);
-                            return;
+                            return true;
                         }
                         LoggerBackend::Tcp(socket) => socket.write(bytes),
                         LoggerBackend::File(file) => file.write(bytes),
@@ -267,13 +276,14 @@ impl InnerLogger {
                     log.tag,
                 ],
                 standard: {
-                    formats: ["{} {} {} {}/{}/{}/{} {} {} [{}] {} {}{}\n"],
+                    formats: ["{} {} {} {}/{}/{}/{}/{} {} {} [{}] {} {}{}\n"],
                     args: [
                         log.context,
                         log.session_address.as_string_or("-"),
                         log.backend_address.as_string_or("-"),
-                        LogDuration(Some(log.response_time)),
+                        LogDuration(Some(log.request_time)),
                         LogDuration(Some(log.service_time)),
+                        LogDuration(log.response_time),
                         LogDuration(log.client_rtt),
                         LogDuration(log.server_rtt),
                         log.bytes_in,
@@ -285,7 +295,7 @@ impl InnerLogger {
                     ]
                 },
                 colored: {
-                    formats: ["\x1b[;1m{}\x1b[m {} {} {}/{}/{}/{} {} {} \x1b[2m[{}] \x1b[;1m{} {:#}\x1b[m{}\n"],
+                    formats: ["\x1b[;1m{}\x1b[m {} {} {}/{}/{}/{}/{} {} {} \x1b[2m[{}] \x1b[;1m{} {:#}\x1b[m{}\n"],
                     args: @,
                 }
             },
@@ -293,6 +303,17 @@ impl InnerLogger {
 
         if let Err(e) = io_result {
             println!("Could not write access log to {}: {e:?}", backend.as_ref());
+            println!(
+                "Trying to revive the backend of access logs to {:?}, or defaulting to {}",
+                self.access_logs_target, self.log_target
+            );
+            let log_target = self.access_logs_target.as_ref().unwrap_or(&self.log_target);
+            if let Err(err) = backend.revive(log_target) {
+                eprintln!("could not revive logger backend: {err}");
+            }
+            false
+        } else {
+            true
         }
     }
 
@@ -305,16 +326,6 @@ impl InnerLogger {
             }
         }
         false
-    }
-
-    pub fn cached_enabled(&self, call_site_state: &mut LogLineCachedState, meta: Metadata) -> bool {
-        if call_site_state.version() == self.version {
-            call_site_state.enabled()
-        } else {
-            let enabled = self.enabled(meta);
-            call_site_state.set(self.version, enabled);
-            enabled
-        }
     }
 
     fn compat_enabled(&self, meta: &log::Metadata) -> bool {
@@ -335,6 +346,13 @@ pub enum LoggerBackend {
     Udp(UdpSocket, SocketAddr),
     Tcp(TcpStream),
     File(crate::writer::MultiLineWriter<File>),
+}
+
+impl LoggerBackend {
+    fn revive(&mut self, log_target: &str) -> Result<(), LogError> {
+        *self = target_to_backend(log_target)?;
+        Ok(())
+    }
 }
 
 #[repr(usize)]
@@ -554,13 +572,16 @@ pub fn parse_logging_spec(spec: &str) -> (Vec<LogDirective>, Vec<LogSpecParseErr
                         // treat that as a global fallback
                         match part0.parse() {
                             Ok(num) => (num, None),
-                            Err(_) => (LogLevelFilter::max(), Some(part0)),
+                            Err(_) => {
+                                errors.push(LogSpecParseError::InvalidLogLevel(s.to_string()));
+                                (LogLevelFilter::max(), None)
+                            }
                         }
                     }
                     (Some(part0), Some(""), None) => (LogLevelFilter::max(), Some(part0)),
                     (Some(part0), Some(part1), None) => match part1.parse() {
                         Ok(num) => (num, Some(part0)),
-                        _ => {
+                        Err(_) => {
                             errors.push(LogSpecParseError::InvalidLogLevel(s.to_string()));
                             continue;
                         }
@@ -584,12 +605,16 @@ pub fn parse_logging_spec(spec: &str) -> (Vec<LogDirective>, Vec<LogSpecParseErr
 }
 
 /// start the logger with all logs and access logs on stdout
-pub fn setup_default_logging(log_colored: bool, log_level: &str, tag: &str) {
+pub fn setup_default_logging(
+    log_colored: bool,
+    log_level: &str,
+    tag: &str,
+) -> Result<(), LogError> {
     setup_logging("stdout", log_colored, None, None, None, log_level, tag)
 }
 
 /// start the logger from config (takes RUST_LOG into account)
-pub fn setup_logging_with_config(config: &Config, tag: &str) {
+pub fn setup_logging_with_config(config: &Config, tag: &str) -> Result<(), LogError> {
     setup_logging(
         &config.log_target,
         config.log_colored,
@@ -613,75 +638,76 @@ pub fn setup_logging(
     access_logs_colored: Option<bool>,
     log_level: &str,
     tag: &str,
-) {
-    let backend = target_to_backend(log_target);
-    let access_backend = access_logs_target.map(target_to_backend);
-
+) -> Result<(), LogError> {
     Logger::init(
         tag.to_string(),
         env::var("RUST_LOG").as_deref().unwrap_or(log_level),
-        backend,
+        log_target,
         log_colored,
-        access_backend,
+        access_logs_target,
         access_logs_format,
         access_logs_colored,
-    );
+    )
 }
 
-pub fn target_to_backend(target: &str) -> LoggerBackend {
-    if target == "stdout" {
-        LoggerBackend::Stdout(stdout())
-    } else if let Some(addr) = target.strip_prefix("udp://") {
-        match addr.to_socket_addrs() {
-            Err(e) => {
-                println!("invalid log target configuration ({e:?}): {target}");
-                LoggerBackend::Stdout(stdout())
-            }
-            Ok(mut addrs) => {
-                let socket = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
-                LoggerBackend::Udp(socket, addrs.next().unwrap())
-            }
-        }
-    } else if let Some(addr) = target.strip_prefix("tcp://") {
-        match addr.to_socket_addrs() {
-            Err(e) => {
-                println!("invalid log target configuration ({e:?}): {target}");
-                LoggerBackend::Stdout(stdout())
-            }
-            Ok(mut addrs) => LoggerBackend::Tcp(TcpStream::connect(addrs.next().unwrap()).unwrap()),
-        }
-    } else if let Some(addr) = target.strip_prefix("unix://") {
-        let path = Path::new(addr);
-        if !path.exists() {
-            println!("invalid log target configuration: {addr} is not a file");
+/// defaults to stdout if the log target is unparseable
+fn target_or_default(target: &str) -> LoggerBackend {
+    match target_to_backend(target) {
+        Ok(backend) => backend,
+        Err(target_error) => {
+            eprintln!("{target_error}, defaulting to stdout");
             LoggerBackend::Stdout(stdout())
-        } else {
-            let mut dir = env::temp_dir();
-            let s: String = thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(12)
-                .map(|c| c as char)
-                .collect();
-            dir.push(s);
-            let socket = UnixDatagram::bind(dir).unwrap();
-            socket.connect(path).unwrap();
-            LoggerBackend::Unix(socket)
         }
-    } else if let Some(addr) = target.strip_prefix("file://") {
-        let path = Path::new(addr);
-        match OpenOptions::new().create(true).append(true).open(path) {
-            Ok(file) => LoggerBackend::File(crate::writer::MultiLineWriter::new(file)),
-            Err(e) => {
-                println!(
-                    "invalid log target configuration: could not open file at {addr} (error: {e:?})"
-                );
-                LoggerBackend::Stdout(stdout())
-            }
-        }
-    } else {
-        println!("invalid log target configuration: {target}");
-        LoggerBackend::Stdout(stdout())
     }
+}
+
+pub fn target_to_backend(target: &str) -> Result<LoggerBackend, LogError> {
+    if target == "stdout" {
+        return Ok(LoggerBackend::Stdout(stdout()));
+    }
+
+    if let Some(addr) = target.strip_prefix("udp://") {
+        let address = addr
+            .parse::<SocketAddr>()
+            .map_err(|e| LogError::InvalidSocketAddress(target.to_owned(), e))?;
+
+        let socket = UdpSocket::bind(("0.0.0.0", 0)).map_err(LogError::UdpBind)?;
+
+        return Ok(LoggerBackend::Udp(socket, address));
+    }
+
+    if let Some(addr) = target.strip_prefix("tcp://") {
+        let tcp_stream =
+            TcpStream::connect(addr).map_err(|e| LogError::TcpConnect(target.to_owned(), e))?;
+
+        return Ok(LoggerBackend::Tcp(tcp_stream));
+    }
+
+    if let Some(addr) = target.strip_prefix("unix://") {
+        let socket = UnixDatagram::unbound().map_err(LogError::CreateUnixSocket)?;
+
+        socket
+            .connect(addr)
+            .map_err(|e| LogError::ConnectToUnixSocket(target.to_owned(), e))?;
+
+        return Ok(LoggerBackend::Unix(socket));
+    }
+
+    if let Some(addr) = target.strip_prefix("file://") {
+        let path = Path::new(addr);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| LogError::OpenFile(target.to_owned(), e))?;
+
+        return Ok(LoggerBackend::File(MultiLineWriter::new(file)));
+    }
+
+    Err(LogError::InvalidLogTarget(
+        target.to_owned(),
+        "Log target is not parseable",
+    ))
 }
 
 #[macro_export]
@@ -764,6 +790,12 @@ macro_rules! _prompt_log {
 pub struct LogLineCachedState(u8);
 const LOG_LINE_ENABLED: u8 = 1 << 7;
 
+impl Default for LogLineCachedState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogLineCachedState {
     pub const fn new() -> Self {
         Self(0)
@@ -789,23 +821,10 @@ impl LogLineCachedState {
 macro_rules! _log_enabled {
     ($logger:expr, $lvl:expr) => {{
         let logger = $logger.borrow_mut();
-        let enable = if cfg!(feature = "logs-cache") {
-            static mut LOG_LINE_CACHED_STATE: $crate::logging::LogLineCachedState =
-                $crate::logging::LogLineCachedState::new();
-            logger.cached_enabled(
-                unsafe { &mut LOG_LINE_CACHED_STATE },
-                $crate::logging::Metadata {
-                    level: $lvl,
-                    target: module_path!(),
-                },
-            )
-        } else {
-            logger.enabled($crate::logging::Metadata {
-                level: $lvl,
-                target: module_path!(),
-            })
-        };
-        if !enable {
+        if !logger.enabled($crate::logging::Metadata {
+            level: $lvl,
+            target: module_path!(),
+        }) {
             return;
         }
         logger
@@ -836,17 +855,27 @@ macro_rules! _log {
 
 #[macro_export]
 macro_rules! _log_access {
-    ($lvl:expr, $($request_record_fields:tt)*) => {{
-        $crate::logging::LOGGER.with(|logger| {
-            let mut logger = $crate::_log_enabled!(logger, $lvl);
-            let (pid, tag, inner) = logger.split();
-            let (now, precise_time) = $crate::logging::now();
+    ($lvl:expr, $on_failure:block, $($request_record_fields:tt)*) => {{
+         $crate::logging::LOGGER.with(|logger| {
+            let success = {
+                let mut logger = $crate::_log_enabled!(logger, $lvl);
+                let (pid, tag, inner) = logger.split();
+                let (now, precise_time) = $crate::logging::now();
 
-            inner.log_access(
-                $crate::_structured_access_log!([$crate::logging::RequestRecord]
-                pid, tag, now, precise_time, level: $lvl, $($request_record_fields)*
-            ));
-        })
+                inner.log_access(
+                    $crate::_structured_access_log!(
+                        [$crate::logging::RequestRecord]
+                        pid, tag, now, precise_time, level: $lvl, $($request_record_fields)*
+                    )
+                )
+            }; // logger dropped here
+
+            if !success {
+                // recording this metric may borrow the logger, so we have
+                // to perform this action after the block above
+                $on_failure
+            }
+        });
     }};
 }
 
@@ -862,29 +891,29 @@ macro_rules! _structured_access_log {
 #[macro_export]
 /// dynamically chose between info_access and error_access
 macro_rules! log_access {
-    ($error:expr, $($request_record_fields:tt)*) => {
+    ($error:expr, on_failure: $on_failure:block, $($request_record_fields:tt)*) => {
         let lvl = if $error {
             $crate::logging::LogLevel::Error
         } else {
             $crate::logging::LogLevel::Info
         };
-        _log_access!(lvl, $($request_record_fields)*);
+        _log_access!(lvl, $on_failure, $($request_record_fields)*);
     };
 }
 
 /// log a failure concerning an HTTP or TCP request
 #[macro_export]
 macro_rules! error_access {
-    ($($request_record_fields:tt)*) => {
-        $crate::_log_access!($crate::logging::LogLevel::Error, $($request_record_fields)*);
+    (on_failure: $on_failure:block, $($request_record_fields:tt)*) => {
+        $crate::_log_access!($crate::logging::LogLevel::Error, $on_failure, $($request_record_fields)*);
     };
 }
 
 /// log the success of an HTTP or TCP request
 #[macro_export]
 macro_rules! info_access {
-    ($($request_record_fields:tt)*) => {
-        $crate::_log_access!($crate::logging::LogLevel::Info, $($request_record_fields)*);
+    (on_failure: $on_failure:block, $($request_record_fields:tt)*) => {
+        $crate::_log_access!($crate::logging::LogLevel::Info, $on_failure, $($request_record_fields)*);
     };
 }
 
@@ -919,7 +948,7 @@ macro_rules! debug {
         #[cfg(any(debug_assertions, feature = "logs-debug", feature = "logs-trace"))]
         $crate::_log!($crate::logging::LogLevel::Debug, concat!("{}\t", $format), module_path!() $(, $args)*);
         #[cfg(not(any(debug_assertions, feature = "logs-trace")))]
-        {$( let _ = $args; )*}
+        if false {$( let _ = $args; )*}
     }};
 }
 
@@ -930,7 +959,7 @@ macro_rules! trace {
         #[cfg(any(debug_assertions, feature = "logs-trace"))]
         $crate::_log!($crate::logging::LogLevel::Trace, concat!("{}\t", $format), module_path!() $(, $args)*);
         #[cfg(not(any(debug_assertions, feature = "logs-trace")))]
-        {$( let _ = $args; )*}
+        if false {$( let _ = $args; )*}
     }};
 }
 
@@ -991,10 +1020,10 @@ impl log::Log for CompatLogger {
 #[macro_export]
 macro_rules! setup_test_logger {
     () => {
-        $crate::logging::Logger::init(
+        let _ = $crate::logging::Logger::init(
             module_path!().to_string(),
             "error",
-            $crate::logging::LoggerBackend::Stdout(::std::io::stdout()),
+            sozu_command_lib::config::DEFAULT_LOG_TARGET,
             false,
             None,
             None,

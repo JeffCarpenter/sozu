@@ -76,13 +76,6 @@ use crate::{
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
 const SERVER_PROTOS: &[&str] = &["http/1.1"];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TlsCluster {
-    cluster_id: String,
-    hostname: String,
-    path_begin: String,
-}
-
 StateMachineBuilder! {
     /// The various Stages of an HTTPS connection:
     ///
@@ -442,6 +435,9 @@ impl ProxySession for HttpsSession {
         }
 
         self.state.cancel_timeouts();
+        // defer backend closing to the state
+        // in case of https it should also send a close notify on the client before the socket is closed below
+        self.state.close(self.proxy.clone(), &mut self.metrics);
 
         let front_socket = self.state.front_socket();
         if let Err(e) = front_socket.shutdown(Shutdown::Both) {
@@ -465,8 +461,6 @@ impl ProxySession for HttpsSession {
         }
         proxy.remove_session(self.frontend_token);
 
-        // defer backend closing to the state
-        self.state.close(self.proxy.clone(), &mut self.metrics);
         self.has_been_closed = true;
     }
 
@@ -625,7 +619,7 @@ impl HttpsListener {
 
         Ok(HttpsListener {
             listener: None,
-            address: config.address.clone().into(),
+            address: config.address.into(),
             resolver,
             rustls_details: server_config,
             active: false,
@@ -648,7 +642,7 @@ impl HttpsListener {
         if self.active {
             return Ok(self.token);
         }
-        let address: StdSocketAddr = self.config.address.clone().into();
+        let address: StdSocketAddr = self.config.address.into();
 
         let mut listener = match tcp_listener {
             Some(tcp_listener) => tcp_listener,
@@ -1089,7 +1083,7 @@ impl HttpsProxy {
         &mut self,
         add_certificate: AddCertificate,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        let address = add_certificate.address.clone().into();
+        let address = add_certificate.address.into();
 
         let listener = self
             .listeners
@@ -1148,7 +1142,7 @@ impl HttpsProxy {
         &mut self,
         replace_certificate: ReplaceCertificate,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        let address = replace_certificate.address.clone().into();
+        let address = replace_certificate.address.into();
 
         let listener = self
             .listeners
@@ -1221,9 +1215,9 @@ impl ProxyConfiguration for HttpsProxy {
                 AcceptError::RegisterError
             })?;
 
-        let public_address: StdSocketAddr = match owned.config.public_address.clone() {
+        let public_address: StdSocketAddr = match owned.config.public_address {
             Some(pub_addr) => pub_addr.into(),
-            None => owned.config.address.clone().into(),
+            None => owned.config.address.into(),
         };
 
         let session = Rc::new(RefCell::new(HttpsSession::new(
@@ -1450,7 +1444,7 @@ pub mod testing {
         max_buffers: usize,
         buffer_size: usize,
     ) -> anyhow::Result<()> {
-        let address = config.address.clone().into();
+        let address = config.address.into();
 
         let ServerParts {
             event_loop,
@@ -1515,7 +1509,7 @@ mod tests {
         proto::command::{CustomHttpAnswers, SocketAddress},
     };
 
-    use crate::router::{trie::TrieNode, MethodRule, PathRule, Route, Router};
+    use crate::router::{pattern_trie::TrieNode, MethodRule, PathRule, Route, Router};
 
     /*
     #[test]

@@ -305,6 +305,8 @@ impl ProxySession for HttpSession {
         }
 
         self.state.cancel_timeouts();
+        // defer backend closing to the state
+        self.state.close(self.proxy.clone(), &mut self.metrics);
 
         let front_socket = self.state.front_socket();
         if let Err(e) = front_socket.shutdown(Shutdown::Both) {
@@ -328,8 +330,6 @@ impl ProxySession for HttpSession {
         }
         proxy.remove_session(self.frontend_token);
 
-        // defer backend closing to the state
-        self.state.close(self.proxy.clone(), &mut self.metrics);
         self.has_been_closed = true;
     }
 
@@ -723,7 +723,7 @@ impl HttpListener {
     pub fn new(config: HttpListenerConfig, token: Token) -> Result<HttpListener, ListenerError> {
         Ok(HttpListener {
             active: false,
-            address: config.address.clone().into(),
+            address: config.address.into(),
             answers: Rc::new(RefCell::new(
                 HttpAnswers::new(&config.http_answers)
                     .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
@@ -744,7 +744,7 @@ impl HttpListener {
         if self.active {
             return Ok(self.token);
         }
-        let address: SocketAddr = self.config.address.clone().into();
+        let address: SocketAddr = self.config.address.into();
 
         let mut listener = match tcp_listener {
             Some(tcp_listener) => tcp_listener,
@@ -910,9 +910,9 @@ impl ProxyConfiguration for HttpProxy {
             return Err(AcceptError::RegisterError);
         }
 
-        let public_address: SocketAddr = match owned.config.public_address.clone() {
+        let public_address: SocketAddr = match owned.config.public_address {
             Some(pub_addr) => pub_addr.into(),
-            None => owned.config.address.clone().into(),
+            None => owned.config.address.into(),
         };
 
         let session = HttpSession::new(
@@ -992,7 +992,7 @@ pub mod testing {
         max_buffers: usize,
         buffer_size: usize,
     ) -> anyhow::Result<()> {
-        let address = config.address.clone().into();
+        let address = config.address.into();
 
         let ServerParts {
             event_loop,

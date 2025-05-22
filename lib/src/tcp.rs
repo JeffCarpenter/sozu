@@ -32,7 +32,7 @@ use crate::{
         Pipe,
     },
     retry::RetryPolicy,
-    server::{push_event, ListenToken, SessionManager, CONN_RETRIES, TIMER},
+    server::{push_event, ListenToken, SessionManager, CONN_RETRIES},
     socket::{server_bind, stats::socket_rtt},
     sozu_command::{
         proto::command::{
@@ -61,6 +61,22 @@ StateMachineBuilder! {
     }
 }
 
+/// This macro is defined uniquely in this module to help the tracking of kawa h1
+/// issues inside Sōzu
+macro_rules! log_context {
+    ($self:expr) => {
+        format!(
+            "TCP\t{}\tSession(frontend={}, backend={})\t >>>",
+            $self.log_context(),
+            $self.frontend_token.0,
+            $self
+                .backend_token
+                .map(|token| token.0.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+        )
+    };
+}
+
 pub struct TcpSession {
     backend_buffer: Option<Checkout>,
     backend_connected: BackendConnectionStatus,
@@ -68,6 +84,7 @@ pub struct TcpSession {
     backend_token: Option<Token>,
     backend: Option<Rc<RefCell<Backend>>>,
     cluster_id: Option<String>,
+    configured_backend_timeout: Duration,
     connection_attempt: u8,
     container_backend_timeout: TimeoutContainer,
     container_frontend_timeout: TimeoutContainer,
@@ -90,6 +107,7 @@ impl TcpSession {
         backend_id: Option<String>,
         cluster_id: Option<String>,
         configured_backend_timeout: Duration,
+        configured_connect_timeout: Duration,
         configured_frontend_timeout: Duration,
         frontend_buffer: Checkout,
         frontend_token: Token,
@@ -107,7 +125,7 @@ impl TcpSession {
 
         let container_frontend_timeout =
             TimeoutContainer::new(configured_frontend_timeout, frontend_token);
-        let container_backend_timeout = TimeoutContainer::new_empty(configured_backend_timeout);
+        let container_backend_timeout = TimeoutContainer::new_empty(configured_connect_timeout);
 
         let state = match proxy_protocol {
             Some(ProxyProtocolConfig::RelayHeader) => {
@@ -177,6 +195,7 @@ impl TcpSession {
             backend_token: None,
             backend: None,
             cluster_id,
+            configured_backend_timeout,
             connection_attempt: 0,
             container_backend_timeout,
             container_frontend_timeout,
@@ -198,6 +217,7 @@ impl TcpSession {
         let context = self.log_context();
         self.metrics.register_end_of_session(&context);
         info_access!(
+            on_failure: { incr!("unsent-access-logs") },
             message: None,
             context,
             session_address: self.frontend_address,
@@ -209,7 +229,8 @@ impl TcpSession {
             server_rtt: None,
             user_agent: None,
             service_time: self.metrics.service_time(),
-            response_time: self.metrics.response_time(),
+            response_time: self.metrics.backend_response_time(),
+            request_time: self.metrics.request_time(),
             bytes_in: self.metrics.bin,
             bytes_out: self.metrics.bout
         );
@@ -245,9 +266,19 @@ impl TcpSession {
 
     fn readable(&mut self) -> SessionResult {
         if !self.container_frontend_timeout.reset() {
-            error!("could not reset front timeout");
+            error!(
+                "{} Could not reset frontend timeout on readable",
+                log_context!(self)
+            );
         }
-
+        if self.backend_connected == BackendConnectionStatus::Connected
+            && !self.container_backend_timeout.reset()
+        {
+            error!(
+                "{} Could not reset backend timeout on readable",
+                log_context!(self)
+            );
+        }
         match &mut self.state {
             TcpStateMachine::Pipe(pipe) => pipe.readable(&mut self.metrics),
             TcpStateMachine::RelayProxyProtocol(pp) => pp.readable(&mut self.metrics),
@@ -265,8 +296,17 @@ impl TcpSession {
     }
 
     fn back_readable(&mut self) -> SessionResult {
+        if !self.container_frontend_timeout.reset() {
+            error!(
+                "{} Could not reset frontend timeout on back_readable",
+                log_context!(self)
+            );
+        }
         if !self.container_backend_timeout.reset() {
-            error!("could not reset back timeout");
+            error!(
+                "{} Could not reset backend timeout on back_readable",
+                log_context!(self)
+            );
         }
 
         match &mut self.state {
@@ -326,12 +366,17 @@ impl TcpSession {
                 self.backend_buffer.take().unwrap(),
                 self.listener.clone(),
             );
+
             pipe.set_cluster_id(self.cluster_id.clone());
             gauge_add!("protocol.proxy.send", -1);
             gauge_add!("protocol.tcp", 1);
             return Some(TcpStateMachine::Pipe(pipe));
         }
-        error!("Missing the frontend or backend buffer queue, we can't switch to a pipe");
+
+        error!(
+            "{} Missing the frontend or backend buffer queue, we can't switch to a pipe",
+            log_context!(self)
+        );
         None
     }
 
@@ -344,7 +389,11 @@ impl TcpSession {
             gauge_add!("protocol.tcp", 1);
             return Some(TcpStateMachine::Pipe(pipe));
         }
-        error!("Missing the backend buffer queue, we can't switch to a pipe");
+
+        error!(
+            "{} Missing the backend buffer queue, we can't switch to a pipe",
+            log_context!(self)
+        );
         None
     }
 
@@ -360,12 +409,17 @@ impl TcpSession {
                 None,
                 self.listener.clone(),
             );
+
             pipe.set_cluster_id(self.cluster_id.clone());
             gauge_add!("protocol.proxy.expect", -1);
             gauge_add!("protocol.tcp", 1);
             return Some(TcpStateMachine::Pipe(pipe));
         }
-        error!("Missing the backend buffer queue, we can't switch to a pipe");
+
+        error!(
+            "{} Missing the backend buffer queue, we can't switch to a pipe",
+            log_context!(self)
+        );
         None
     }
 
@@ -395,7 +449,14 @@ impl TcpSession {
             TcpStateMachine::SendProxyProtocol(pp) => pp.set_back_socket(socket),
             TcpStateMachine::RelayProxyProtocol(pp) => pp.set_back_socket(socket),
             TcpStateMachine::ExpectProxyProtocol(_) => {
-                panic!("we should not set the back socket for the expect proxy protocol")
+                error!(
+                    "{} We should not set the back socket for the expect proxy protocol",
+                    log_context!(self)
+                );
+                panic!(
+                    "{} We should not set the back socket for the expect proxy protocol",
+                    log_context!(self)
+                );
             }
             TcpStateMachine::FailedUpgrade(_) => unreachable!(),
         }
@@ -436,6 +497,13 @@ impl TcpSession {
                 self.cluster_id.as_deref(),
                 self.metrics.backend_id.as_deref()
             );
+
+            // the back timeout was of connect_timeout duration before,
+            // now that we're connected, move to backend_timeout duration
+            self.container_backend_timeout
+                .set_duration(self.configured_backend_timeout);
+            self.container_frontend_timeout.reset();
+
             if let TcpStateMachine::SendProxyProtocol(spp) = &mut self.state {
                 spp.set_back_connected(BackendConnectionStatus::Connected);
             }
@@ -513,10 +581,6 @@ impl TcpSession {
         }
     }
 
-    fn reset_connection_attempt(&mut self) {
-        self.connection_attempt = 0;
-    }
-
     pub fn test_back_socket(&mut self) -> SessionIsToBeClosed {
         match self.back_socket_mut() {
             Some(ref mut s) => {
@@ -553,17 +617,31 @@ impl TcpSession {
                 // trigger a backend reconnection
                 self.close_backend();
                 let connection_result = self.connect_to_backend(session.clone());
+                if let Err(err) = &connection_result {
+                    error!(
+                        "{} Error connecting to backend: {}",
+                        log_context!(self),
+                        err
+                    );
+                }
+
                 if let Some(state_result) = handle_connection_result(connection_result) {
                     return state_result;
                 }
             } else if self.back_readiness().unwrap().event != Ready::EMPTY {
-                self.reset_connection_attempt();
-                let back_token = self.backend_token.unwrap();
-                self.container_backend_timeout.set(back_token);
+                self.connection_attempt = 0;
                 self.set_back_connected(BackendConnectionStatus::Connected);
             }
         } else if back_connected == BackendConnectionStatus::NotConnected {
             let connection_result = self.connect_to_backend(session.clone());
+            if let Err(err) = &connection_result {
+                error!(
+                    "{} Error connecting to backend: {}",
+                    log_context!(self),
+                    err
+                );
+            }
+
             if let Some(state_result) = handle_connection_result(connection_result) {
                 return state_result;
             }
@@ -577,7 +655,6 @@ impl TcpSession {
             return session_result;
         }
 
-        let token = self.frontend_token;
         while counter < MAX_LOOP_ITERATIONS {
             let front_interest = self.front_readiness().interest & self.front_readiness().event;
             let back_interest = self
@@ -586,11 +663,10 @@ impl TcpSession {
                 .unwrap_or(Ready::EMPTY);
 
             trace!(
-                "PROXY\t{} {:?} {:?} -> {:?}",
-                self.log_context().to_string(),
-                token,
-                self.front_readiness().clone(),
-                self.back_readiness()
+                "{} Frontend interest({:?}) and backend interest({:?})",
+                log_context!(self),
+                front_interest,
+                back_interest
             );
 
             if front_interest == Ready::EMPTY && back_interest == Ready::EMPTY {
@@ -644,8 +720,8 @@ impl TcpSession {
 
             if front_interest.is_error() {
                 error!(
-                    "PROXY session {:?} front error, disconnecting",
-                    self.frontend_token
+                    "{} Frontend socket error, disconnecting",
+                    log_context!(self)
                 );
                 self.front_readiness().interest = Ready::EMPTY;
                 if let Some(r) = self.back_readiness() {
@@ -661,10 +737,7 @@ impl TcpSession {
                     r.interest = Ready::EMPTY;
                 }
 
-                error!(
-                    "PROXY session {:?} back error, disconnecting",
-                    self.frontend_token
-                );
+                error!("{} backend socket error, disconnecting", log_context!(self));
                 return SessionResult::Close;
             }
 
@@ -673,9 +746,10 @@ impl TcpSession {
 
         if counter >= MAX_LOOP_ITERATIONS {
             error!(
-                "PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection",
-                self.frontend_token, MAX_LOOP_ITERATIONS
+                "{} Handling session went through {} iterations, there's a probable infinite loop bug, closing the connection",
+                log_context!(self), MAX_LOOP_ITERATIONS
             );
+
             incr!("tcp.infinite_loop.error");
 
             let front_interest = self.front_readiness().interest & self.front_readiness().event;
@@ -684,16 +758,17 @@ impl TcpSession {
                 .map(|r| r.interest & r.event)
                 .unwrap_or(Ready::EMPTY);
 
-            let front_token = self.frontend_token;
             let back = self.back_readiness().cloned();
+
             error!(
-                "PROXY\t{:?} readiness: front {:?} / back {:?} | front: {:?} | back: {:?} ",
-                front_token,
+                "{} readiness: front {:?} / back {:?} | front: {:?} | back: {:?} ",
+                log_context!(self),
                 self.front_readiness(),
                 back,
                 front_interest,
                 back_interest
             );
+
             self.print_session();
 
             return SessionResult::Close;
@@ -710,7 +785,12 @@ impl TcpSession {
         ) {
             let proxy = self.proxy.borrow();
             if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                error!("error deregistering socket({:?}): {:?}", fd, e);
+                error!(
+                    "{} Error deregistering socket({:?}): {:?}",
+                    log_context!(self),
+                    fd,
+                    e
+                );
             }
 
             proxy.sessions.borrow_mut().slab.try_remove(token.0);
@@ -723,10 +803,14 @@ impl TcpSession {
                 r.event = Ready::EMPTY;
             }
 
+            let log_context = log_context!(self);
             if let Some(sock) = self.back_socket_mut() {
                 if let Err(e) = sock.shutdown(Shutdown::Both) {
                     if e.kind() != ErrorKind::NotConnected {
-                        error!("error closing back socket({:?}): {:?}", sock, e);
+                        error!(
+                            "{} Error closing back socket({:?}): {:?}",
+                            log_context, sock, e
+                        );
                     }
                 }
             }
@@ -759,7 +843,11 @@ impl TcpSession {
         self.cluster_id = Some(cluster_id.clone());
 
         if self.connection_attempt >= CONN_RETRIES {
-            error!("{} max connection attempt reached", self.log_context());
+            error!(
+                "{} Max connection attempt reached ({})",
+                log_context!(self),
+                self.connection_attempt
+            );
             return Err(BackendConnectionError::MaxConnectionRetries(Some(
                 cluster_id,
             )));
@@ -777,22 +865,12 @@ impl TcpSession {
             .backend_from_cluster_id(&cluster_id)
             .map_err(BackendConnectionError::Backend)?;
 
-        /*
-        this was the old error matching for backend_from_cluster_id.
-        panic! is called in case of mio::net::MioTcpStream::connect() error
-        Do we really want to panic ?
-        Err(ConnectionError::NoBackendAvailable(c_id)) => {
-            Err(ConnectionError::NoBackendAvailable(c_id))
-        }
-        Err(e) => {
-            panic!("tcp connect_to_backend: unexpected error: {:?}", e);
-        }
-        */
-
         if let Err(e) = stream.set_nodelay(true) {
             error!(
-                "error setting nodelay on back socket({:?}): {:?}",
-                stream, e
+                "{} Error setting nodelay on back socket({:?}): {:?}",
+                log_context!(self),
+                stream,
+                e
             );
         }
         self.backend_connected = BackendConnectionStatus::Connecting(Instant::now());
@@ -811,13 +889,14 @@ impl TcpSession {
             back_token,
             Interest::READABLE | Interest::WRITABLE,
         ) {
-            error!("error registering back socket({:?}): {:?}", stream, e);
+            error!(
+                "{} Error registering back socket({:?}): {:?}",
+                log_context!(self),
+                stream,
+                e
+            );
         }
 
-        let connect_timeout_duration =
-            Duration::from_secs(self.listener.borrow().config.connect_timeout as u64);
-        self.container_backend_timeout
-            .set_duration(connect_timeout_duration);
         self.container_backend_timeout.set(back_token);
 
         self.set_back_token(back_token);
@@ -838,7 +917,7 @@ impl ProxySession for TcpSession {
         }
 
         // TODO: the state should handle the timeouts
-        trace!("Closing TCP session");
+        trace!("{} Closing TCP session", log_context!(self));
         self.metrics.service_stop();
 
         // Restore gauges
@@ -866,8 +945,10 @@ impl ProxySession for TcpSession {
             // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
             if e.kind() != ErrorKind::NotConnected {
                 error!(
-                    "error shutting down front socket({:?}): {:?}",
-                    front_socket, e
+                    "{} Error shutting down front socket({:?}): {:?}",
+                    log_context!(self),
+                    front_socket,
+                    e
                 );
             }
         }
@@ -878,8 +959,10 @@ impl ProxySession for TcpSession {
             let fd = front_socket.as_raw_fd();
             if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
                 error!(
-                    "error deregistering front socket({:?}) while closing TCP session: {:?}",
-                    fd, e
+                    "{} Error deregistering front socket({:?}) while closing TCP session: {:?}",
+                    log_context!(self),
+                    fd,
+                    e
                 );
             }
             proxy
@@ -895,14 +978,11 @@ impl ProxySession for TcpSession {
 
     fn timeout(&mut self, token: Token) -> SessionIsToBeClosed {
         if self.frontend_token == token {
-            let dur = Instant::now() - self.last_event;
-            let front_timeout = self.container_frontend_timeout.duration();
-            if dur < front_timeout {
-                TIMER.with(|timer| {
-                    timer.borrow_mut().set_timeout(front_timeout - dur, token);
-                });
-                return false;
-            }
+            self.container_frontend_timeout.triggered();
+            return true;
+        }
+        if self.backend_token == Some(token) {
+            self.container_backend_timeout.triggered();
             return true;
         }
         // invalid token, obsolete timeout triggered
@@ -915,10 +995,12 @@ impl ProxySession for TcpSession {
 
     fn update_readiness(&mut self, token: Token, events: Ready) {
         trace!(
-            "token {:?} got event {}",
+            "{} token {:?} got event {}",
+            log_context!(self),
             token,
             super::ready_to_string(events)
         );
+
         self.last_event = Instant::now();
         self.metrics.wait_start();
 
@@ -984,11 +1066,12 @@ impl ProxySession for TcpSession {
 
         error!(
             "\
-TCP Session ({:?})
+{} Session ({:?})
 \tFrontend:
 \t\ttoken: {:?}\treadiness: {:?}
 \tBackend:
 \t\ttoken: {:?}\treadiness: {:?}\tstatus: {:?}\tcluster id: {:?}",
+            log_context!(self),
             state,
             self.frontend_token,
             front_readiness,
@@ -1038,7 +1121,7 @@ impl TcpListener {
             cluster_id: None,
             listener: None,
             token,
-            address: config.address.clone().into(),
+            address: config.address.into(),
             config,
             active: false,
             tags: BTreeMap::new(),
@@ -1057,7 +1140,7 @@ impl TcpListener {
         let mut listener = match tcp_listener {
             Some(listener) => listener,
             None => {
-                let address = self.config.address.clone().into();
+                let address = self.config.address.into();
                 server_bind(address).map_err(|e| ProxyError::BindToSocket(address, e))?
             }
         };
@@ -1082,8 +1165,7 @@ fn handle_connection_result(
             // we must wait for an event
             Some(SessionResult::Continue)
         }
-        Err(connection_error) => {
-            error!("Error connecting to backend: {}", connection_error);
+        Err(_) => {
             // in case of BackendConnectionError::Backend(BackendError::ConnectionFailures(..))
             // we may want to retry instead of closing
             Some(SessionResult::Close)
@@ -1185,7 +1267,7 @@ impl TcpProxy {
             .listeners
             .values()
             .find(|listener| listener.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
+            .ok_or(ProxyError::NoListenerFound(address))?;
 
         let mut owned = listener.borrow_mut();
 
@@ -1296,7 +1378,7 @@ impl ProxyConfiguration for TcpProxy {
                 WorkerResponse::ok(message.id)
             }
             RequestType::RemoveListener(remove) => {
-                if !self.remove_listener(remove.address.clone().into()) {
+                if !self.remove_listener(remove.address.into()) {
                     WorkerResponse::error(
                         message.id,
                         format!("no TCP listener to remove at address {:?}", remove.address),
@@ -1409,6 +1491,7 @@ impl ProxyConfiguration for TcpProxy {
             None,
             owned.cluster_id.clone(),
             Duration::from_secs(owned.config.back_timeout as u64),
+            Duration::from_secs(owned.config.connect_timeout as u64),
             Duration::from_secs(owned.config.front_timeout as u64),
             front_buffer,
             frontend_token,
@@ -1437,7 +1520,7 @@ pub mod testing {
         buffer_size: usize,
         channel: ProxyChannel,
     ) -> anyhow::Result<()> {
-        let address = config.address.clone().into();
+        let address = config.address.into();
 
         let ServerParts {
             event_loop,

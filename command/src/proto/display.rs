@@ -14,15 +14,18 @@ use crate::{
             filtered_metrics, protobuf_endpoint, request::RequestType,
             response_content::ContentType, AggregatedMetrics, AvailableMetrics, CertificateAndKey,
             CertificateSummary, CertificatesWithFingerprints, ClusterMetrics, CustomHttpAnswers,
-            FilteredMetrics, HttpEndpoint, HttpListenerConfig, HttpsListenerConfig,
-            ListOfCertificatesByAddress, ListedFrontends, ListenersList, ProtobufEndpoint,
-            QueryCertificatesFilters, RequestCounts, Response, ResponseContent, ResponseStatus,
-            RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses,
+            Event, EventKind, FilteredMetrics, HttpEndpoint, HttpListenerConfig,
+            HttpsListenerConfig, ListOfCertificatesByAddress, ListedFrontends, ListenersList,
+            ProtobufEndpoint, QueryCertificatesFilters, RequestCounts, Response, ResponseContent,
+            ResponseStatus, RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics,
+            WorkerResponses,
         },
         DisplayError,
     },
     AsString,
 };
+
+use super::command::FilteredHistogram;
 
 impl Display for CertificateAndKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -239,11 +242,25 @@ pub fn print_metrics(aggregated_metrics: &AggregatedMetrics) -> Result<(), Displ
     println!("\nMAIN PROCESS\n============");
     print_proxy_metrics(&aggregated_metrics.main);
 
-    // workers
-    for (worker_id, worker_metrics) in aggregated_metrics.workers.iter() {
-        println!("\nWorker {worker_id}\n=========");
-        print_worker_metrics(worker_metrics)?;
+    if !aggregated_metrics.proxying.is_empty() {
+        println!("\nPROXYING\n============");
+        print_proxy_metrics(&aggregated_metrics.proxying);
     }
+
+    // workers
+    for (worker_id, worker) in aggregated_metrics.workers.iter() {
+        if !worker.clusters.is_empty() && !worker.proxy.is_empty() {
+            println!("\nWorker {worker_id}\n=========");
+            print_worker_metrics(worker)?;
+        }
+    }
+
+    // clusters
+    if !aggregated_metrics.clusters.is_empty() {
+        println!("\nClusters\n=======");
+        print_cluster_metrics(&aggregated_metrics.clusters);
+    }
+
     Ok(())
 }
 
@@ -251,6 +268,7 @@ fn print_proxy_metrics(proxy_metrics: &BTreeMap<String, FilteredMetrics>) {
     let filtered = filter_metrics(proxy_metrics);
     print_gauges_and_counts(&filtered);
     print_percentiles(&filtered);
+    print_histograms(&filtered);
 }
 
 fn print_worker_metrics(worker_metrics: &WorkerMetrics) -> Result<(), DisplayError> {
@@ -267,12 +285,29 @@ fn print_cluster_metrics(cluster_metrics: &BTreeMap<String, ClusterMetrics>) {
         let filtered = filter_metrics(&cluster_metrics_data.cluster);
         print_gauges_and_counts(&filtered);
         print_percentiles(&filtered);
+        print_histograms(&filtered);
 
-        for backend_metrics in cluster_metrics_data.backends.iter() {
-            println!("\n{cluster_id}/{}\n--------", backend_metrics.backend_id);
-            let filtered = filter_metrics(&backend_metrics.metrics);
+        // backend_id -> (metric_name -> value )
+        let mut backend_metric_acc: HashMap<String, BTreeMap<String, FilteredMetrics>> =
+            HashMap::new();
+
+        for backend in &cluster_metrics_data.backends {
+            for (metric_name, value) in &backend.metrics {
+                backend_metric_acc
+                    .entry(backend.backend_id.clone())
+                    .and_modify(|map| {
+                        map.insert(metric_name.clone(), value.clone());
+                    })
+                    .or_insert(BTreeMap::from([(metric_name.clone(), value.clone())]));
+            }
+        }
+
+        for (backend_id, metrics) in backend_metric_acc {
+            println!("\n{cluster_id}/{backend_id}\n--------");
+            let filtered = filter_metrics(&metrics);
             print_gauges_and_counts(&filtered);
             print_percentiles(&filtered);
+            print_histograms(&filtered);
         }
     }
 }
@@ -389,6 +424,59 @@ fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
     }
 
     percentile_table.printstd();
+}
+
+fn print_histograms(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
+    let histograms: BTreeMap<String, FilteredHistogram> = filtered_metrics
+        .iter()
+        .filter_map(|(name, metric)| match metric.inner.clone() {
+            Some(filtered_metrics::Inner::Histogram(hist)) => Some((name.to_owned(), hist)),
+            _ => None,
+        })
+        .collect();
+
+    let mut histogram_titles: Vec<String> = histograms.keys().map(ToOwned::to_owned).collect();
+    histogram_titles.sort();
+    if histogram_titles.is_empty() {
+        return;
+    }
+
+    let mut histogram_table = Table::new();
+    histogram_table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+
+    let mut first_row = Row::new(vec![cell!("Histograms (ms)"), cell!("sum"), cell!("count")]);
+
+    let biggest_hist_length = histograms
+        .values()
+        .map(|hist| hist.buckets.len())
+        .max()
+        .unwrap_or(0);
+
+    // 0, 1, 3, 7... in the upper row
+    for exponent in 0..biggest_hist_length {
+        first_row.add_cell(cell!(format!("{}", (1 << exponent) - 1)));
+    }
+    histogram_table.set_titles(first_row);
+
+    for title in histogram_titles {
+        if let Some(hist) = histograms.get(&title) {
+            let trimmed_name = title.strip_suffix("_histogram").unwrap_or_default();
+            let mut row = Row::new(vec![
+                cell!(trimmed_name),
+                cell!(hist.sum),
+                cell!(hist.count),
+            ]);
+            // display the count by bucket, not the incremented count
+            let mut last_bucket_count = 0;
+            for bucket in &hist.buckets {
+                row.add_cell(cell!(bucket.count - last_bucket_count));
+                last_bucket_count = bucket.count;
+            }
+            histogram_table.add_row(row);
+        }
+    }
+
+    histogram_table.printstd();
 }
 
 fn print_available_metrics(available_metrics: &AvailableMetrics) -> Result<(), DisplayError> {
@@ -888,7 +976,7 @@ fn create_cluster_table(headers: Vec<&str>, data: &BTreeMap<String, ResponseCont
 
 impl Display for SocketAddress {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", SocketAddr::from(self.clone()))
+        write!(f, "{}", SocketAddr::from(*self))
     }
 }
 
@@ -1004,5 +1092,28 @@ impl CustomHttpAnswers {
             }
         }
         rows
+    }
+}
+
+impl Display for Event {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let kind = match self.kind() {
+            EventKind::BackendDown => "backend down",
+            EventKind::BackendUp => "backend up",
+            EventKind::NoAvailableBackends => "no available backends",
+            EventKind::RemovedBackendHasNoConnections => "removed backend has no connections",
+        };
+        let address = match &self.address {
+            Some(a) => a.to_string(),
+            None => String::new(),
+        };
+        write!(
+            f,
+            "{}, backend={}, cluster={}, address={}",
+            kind,
+            self.backend_id(),
+            self.cluster_id(),
+            address,
+        )
     }
 }

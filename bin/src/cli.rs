@@ -180,7 +180,10 @@ pub enum SubCmd {
         #[clap(subcommand)]
         cmd: ConfigCmd,
     },
-    #[clap(name = "events", about = "receive sozu events")]
+    #[clap(
+        name = "events",
+        about = "receive sozu events about the status of backends"
+    )]
     Events,
 }
 
@@ -228,6 +231,12 @@ pub enum MetricsCmd {
             help = "get only the metrics of main process and workers (no cluster metrics)"
         )]
         no_clusters: bool,
+        #[clap(
+            short = 'w',
+            long = "workers",
+            help = "display metrics of each worker, without merging by metric name or cluster id (takes more space)"
+        )]
+        workers: bool,
     },
 }
 
