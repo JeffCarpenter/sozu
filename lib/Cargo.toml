@@ -57,6 +57,7 @@ thiserror = { workspace = true }
 time = { workspace = true }
 
 sozu-command-lib = { workspace = true }
+lru = "0.12" # Added for forward proxy caching
 
 [dev-dependencies]
 quickcheck = { workspace = true }
