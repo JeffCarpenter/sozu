@@ -31,6 +31,12 @@ pub enum BackendError {
         failures: usize,
         error: String,
     },
+    #[error("No healthy backends available for {0}")]
+    NoHealthyBackends(String),
+    #[error("Internal error: {0}")]
+    InternalError(String),
+    #[error("Connection refused or timed out")]
+    ConnectionRefusedOrTimedOut,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]

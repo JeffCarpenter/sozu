@@ -136,6 +136,7 @@ impl HttpSession {
                 request_id,
                 session_address,
                 sticky_name.clone(),
+                None, // tls_config for HTTP
             )?)
         };
 
@@ -202,6 +203,7 @@ impl HttpSession {
                     expect.request_id,
                     Some(session_address),
                     self.sticky_name.clone(),
+                    None, // tls_config for HTTP
                 )
                 .ok()?;
                 http.frontend_readiness.event = expect.frontend_readiness.event;

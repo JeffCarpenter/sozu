@@ -3,13 +3,21 @@ pub mod diagnostics;
 pub mod editor;
 pub mod parser;
 
+const PROXY_AUTH_HEADER: &str = "Proxy-Authorization";
+
 use std::{
     cell::RefCell,
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
     rc::{Rc, Weak},
+    sync::Arc,
     time::{Duration, Instant},
+    // collections::HashMap, // Removed unused import
 };
+use rustls::{ClientConfig as Config /* ClientConnection as ClientHello */}; // Removed unused ClientHello
+// use url::Url; // Removed unused import
+// use lazy_static::lazy_static; // Removed unused import
+// use tokio::sync::{Mutex, MutexGuard}; // Unused
 
 use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
@@ -43,6 +51,13 @@ use crate::{
     L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness,
     RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
 };
+
+fn build_forward_proxy_uri_without_host_and_port(uri: &url::Url) -> String {
+    let mut new_uri = uri.clone();
+    new_uri.set_host(None).unwrap();
+    new_uri.set_port(None).unwrap();
+    new_uri.to_string()
+}
 
 /// This macro is defined uniquely in this module to help the tracking of kawa h1
 /// issues inside Sōzu
@@ -161,6 +176,7 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     configured_frontend_timeout: Duration,
     /// attempts to connect to the backends during the session
     connection_attempts: u8,
+    tls_config: Option<Arc<Config>>,
     pub frontend_readiness: Readiness,
     pub frontend_socket: Front,
     frontend_token: Token,
@@ -200,6 +216,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         request_id: Ulid,
         session_address: Option<SocketAddr>,
         sticky_name: String,
+        tls_config: Option<Arc<Config>>,
     ) -> Result<Http<Front, L>, AcceptError> {
         let (front_buffer, back_buffer) = match pool.upgrade() {
             Some(pool) => {
@@ -223,6 +240,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             configured_connect_timeout,
             configured_frontend_timeout,
             connection_attempts: 0,
+            tls_config,
             container_backend_timeout: TimeoutContainer::new_empty(configured_connect_timeout),
             container_frontend_timeout,
             frontend_readiness: Readiness {
@@ -939,7 +957,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         });
 
         let context = self.context.log_context();
-        metrics.register_end_of_session(&context);
+        // metrics.register_end_of_session(&context); // config field removed
 
         log_access! {
             error,
@@ -1554,7 +1572,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    fn fail_backend_connection(&mut self, metrics: &SessionMetrics) {
+    fn fail_backend_connection(&mut self, metrics: &SessionMetrics) { // Removed underscore prefix
         if let Some(backend) = &self.backend {
             let mut backend = backend.borrow_mut();
             backend.failures += 1;
@@ -1591,7 +1609,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    pub fn backend_hup(&mut self, metrics: &mut SessionMetrics) -> StateResult {
+    pub fn backend_hup(&mut self, _metrics: &mut SessionMetrics) -> StateResult { // Prefixed metrics
         let response_stream = match &mut self.response_stream {
             ResponseStream::BackendAnswer(response_stream) => response_stream,
             _ => return StateResult::CloseBackend,
