@@ -16,6 +16,12 @@ jobs:
           - rust: nightly
             experimental: true
     steps:
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          override: true
+          components: clippy
       - name: install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Checkout sources
@@ -33,7 +39,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
       - name: Install Clippy
-        run: rustup component add clippy
       - name: Run cargo clippy --fix (check for unapplied lints)
         run: |
           cargo clippy --all-targets --all-features -- -D warnings --fix --allow-dirty --allow-staged
@@ -50,6 +55,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Checkout sources
         uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
       - name: Cache cargo dependencies
         uses: actions/cache@v4
         with:
@@ -72,6 +82,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Checkout sources
         uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
       - name: Cache cargo dependencies
         uses: actions/cache@v4
         with:
@@ -108,6 +123,11 @@ jobs:
           protoc --version
       - name: Checkout sources
         uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
       - name: Cache cargo dependencies
         uses: actions/cache@v4
         with:

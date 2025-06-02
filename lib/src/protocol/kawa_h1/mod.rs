@@ -14,14 +14,6 @@ use std::{
 use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use url::Url; // Added for forward proxy URI parsing
-
-// --- BEGIN CACHING ADDITIONS ---
-use std::sync::Mutex;
-use lru::LruCache;
-use std::num::NonZeroUsize;
-use lazy_static::lazy_static;
-// --- END CACHING ADDITIONS ---
-
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
     logging::EndpointRecord,
@@ -155,7 +147,7 @@ pub enum ResponseStream {
 }
 
 /// Http will be contained in State which itself is contained by Session
-pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
+pub struct Http<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> {
     answers: Rc<RefCell<answers::HttpAnswers>>,
     pub backend: Option<Rc<RefCell<Backend>>>,
     backend_connection_status: BackendConnectionStatus,
@@ -197,24 +189,14 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     /// Buffer for sending "HTTP/1.1 200 Connection established" for CONNECT.
     connect_response_buffer: Option<Vec<u8>>,
     // --- End of Fields for Forward Proxy support ---
-
-    // --- Fields for Caching ---
-    // serving_from_cache: Option<CachedResponse>, // Replaced by current_cached_response_to_serve
-    // Store the cache key for the current request if it's cacheable,
-    // so we can use it when populating the cache after fetching from origin.
-    current_cache_key: Option<CacheKey>,
-    // New fields for managing state of serving a cached response
-    current_cached_response_to_serve: Option<CachedResponse>,
-    cached_response_headers_sent: bool,
-    cached_response_body_bytes_written: usize,
-    // Temporary buffer for constructing and sending cached response headers + part of body
-    // This is to handle cases where headers + initial body chunk might be sent together.
-    // Or simply, manage header sending state separately.
-    // Let's try with just the headers_sent flag and body_bytes_written first.
-    // --- End of Fields for Caching ---
 }
 
-impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
+// NOTE: The Debug bound was already added to this impl block in Turn 24.
+// The struct definition was updated in Turn 33.
+// This SEARCH block is to find the impl block for SessionState.
+// The actual change needed is on the SessionState impl block.
+// However, I will ensure this block also has the Debug bound, just in case.
+impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
     /// Instantiate a new HTTP SessionState with:
     ///
     /// - frontend_interest: READABLE | HUP | ERROR
@@ -309,12 +291,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             forward_target_port: None,
             is_connect_tunnel: false,
             connect_response_buffer: None,
-            // Init cache fields
-            // serving_from_cache: None, // Replaced
-            current_cache_key: None,
-            current_cached_response_to_serve: None,
-            cached_response_headers_sent: false,
-            cached_response_body_bytes_written: 0,
         })
     }
 
@@ -334,15 +310,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.forward_target_scheme = None;
         self.forward_target_host = None;
         self.forward_target_port = None;
-        self.is_connect_tunnel = false; // Should already be false if not in a tunnel
+        self.is_connect_tunnel = false;
         self.connect_response_buffer = None;
-        // Reset cache fields
-        // self.serving_from_cache = None; // Replaced
-        self.current_cache_key = None;
-        self.current_cached_response_to_serve = None;
-        self.cached_response_headers_sent = false;
-        self.cached_response_body_bytes_written = 0;
-
 
         self.request_stream.clear();
         response_stream.clear();
@@ -481,114 +450,27 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         kawa::h1::parse(&mut self.request_stream, &mut self.context);
         // kawa::debug_kawa(&self.request_stream);
 
-        // --- BEGIN CACHING LOOKUP ---
-        // Only attempt cache lookup if not already serving from cache, not in tunnel mode, and is GET.
-        if self.current_cached_response_to_serve.is_none() && !self.is_connect_tunnel && self.context.method == Some(Method::Get) {
-            // Simplified Cache-Control check (client headers)
-            let mut bypass_cache = false;
-            for (name, value) in self.request_stream.detached.headers.iter() {
-                if name.eq_ignore_ascii_case(b"Cache-Control") && value.eq_ignore_ascii_case(b"no-cache") {
-                    bypass_cache = true;
-                    info!("{} Client sent Cache-Control: no-cache. Bypassing cache lookup.", log_context!(self));
-                    break;
-                }
-                if name.eq_ignore_ascii_case(b"Pragma") && value.eq_ignore_ascii_case(b"no-cache") {
-                    bypass_cache = true;
-                    info!("{} Client sent Pragma: no-cache. Bypassing cache lookup.", log_context!(self));
-                    break;
-                }
-            }
+        // --- BEGIN FORWARD PROXY LOGIC (Absolute URI and CONNECT detection in readable()) ---
+        if !self.is_forward_proxy_request && // Avoid re-processing if already marked (e.g. by previous parse in pipelined req)
+           (!self.request_stream.is_initial() && !self.request_stream.is_terminated()) { // Check if headers are parsed or body started
 
-            if !bypass_cache {
-                // Construct cache key based on the potentially *original* (pre-normalization) path/authority from context,
-                // as this is before the forward proxy logic modifies them for upstream request.
-                // However, for consistency, it's better to form the key *after* normalization if possible,
-                // or ensure normalization is idempotent for cache key generation.
-                // For now, using potentially original values from context.path (if absolute) or context.authority + context.path.
-
-                let key_uri_str = if self.context.path.as_deref().unwrap_or("").contains("://") {
-                    self.context.path.as_deref().unwrap_or("").to_string()
-                } else if let Some(authority) = self.context.authority.as_deref() {
-                    // Attempt to reconstruct. This assumes "http" if no scheme was part of absolute URI path.
-                    // This part is tricky because self.forward_target_scheme is set later.
-                    // For now, we rely on the absolute URI detection to have set self.is_forward_proxy_request
-                    // and the forward_target_scheme if path was absolute.
-                    // If path was not absolute, this key might be less effective or incorrect for caching.
-                    // Let's refine this: the key for lookup should ideally be what the *client sent* as target.
-                    let scheme_prefix = if self.context.protocol == Protocol::HTTPS { "https://" } else { "http://" };
-                    format!("{}{}{}", scheme_prefix, authority, self.context.path.as_deref().unwrap_or("/"))
-                } else {
-                    String::new() // Cannot form a good key
-                };
-
-                if !key_uri_str.is_empty() {
-                    let key = format!("GET::{}", key_uri_str);
-                    // self.current_cache_key is set *after* full URI normalization, before connecting to origin.
-                    // Here we just use the generated key for lookup.
-
-                    if let Ok(mut cache) = HTTP_FORWARD_CACHE.lock() {
-                        if let Some(cached_item) = cache.get(&key) {
-                            info!("{} Cache HIT for key: {}", log_context!(self), key);
-                            self.current_cached_response_to_serve = Some(cached_item.clone());
-                            self.cached_response_headers_sent = false;
-                            self.cached_response_body_bytes_written = 0;
-                            // Bypassing further request processing and backend connection.
-                            // Ensure writable() will be called to serve this.
-                            self.frontend_readiness.interest.insert(Ready::WRITABLE);
-                            // No need to read further from client for this request.
-                            self.frontend_readiness.interest.remove(Ready::READABLE);
-                            // Clear events that might have been processed before this point in the loop
-                            self.frontend_readiness.event = Ready::EMPTY;
-                            self.backend_readiness.event = Ready::EMPTY;
-                            return StateResult::Continue; // Let writable() handle it.
-                        } else {
-                            info!("{} Cache MISS for key: {}", log_context!(self), key);
-                        }
-                    }
-                }
-            }
-        }
-        // --- END CACHING LOOKUP ---
-
-        // --- BEGIN FORWARD PROXY LOGIC (Absolute URI and CONNECT detection) ---
-        // This includes URI normalization which is important for generating the definitive cache key later.
-        // This runs after kawa::h1::parse, so self.context fields are populated.
-        // We only do this if it's not already marked as a forward request (e.g., by CONNECT later)
-        // and if we are in a state where headers are parsed or being parsed.
-        if !self.is_forward_proxy_request && // Not already marked by CONNECT
-           (self.request_stream.is_header_phase() || self.request_stream.is_main_phase()) {
-
-            let can_be_absolute_uri_forward =
-                // Condition 1: No cluster was assigned by router (implicit forward proxy mode)
-                self.context.cluster_id.is_none() ||
-                // Condition 2: Or, it's an HTTP/0.9-like simple request where authority might be missing
-                // and path IS the absolute URI. (This part is more speculative for Sozu's typical use)
+            // Absolute URI detection
+            // Condition: No cluster assigned by router OR (no authority from kawa AND path looks like an absolute URI)
+            // This second part is to catch cases where `kawa` might not parse authority for absolute-form requests if not expected.
+            let can_be_absolute_uri_forward = self.context.cluster_id.is_none() ||
                 (self.context.authority.is_none() && self.context.path.as_ref().map_or(false, |p| p.contains("://")));
 
-            info!(
-                "{} Post-parse context. Authority: {:?}, Path: {:?}",
-                log_context!(self),
-                self.context.authority,
-                self.context.path
-            );
-
             if let Some(request_path_str) = self.context.path.as_deref() {
-                // Basic check for "scheme://" to identify potential absolute URIs.
-                // Act on it if it's a potential forward proxy scenario (no cluster OR path is absolute URI and no authority)
                 if request_path_str.contains("://") && can_be_absolute_uri_forward {
                     match Url::parse(request_path_str) {
                         Ok(parsed_url) => {
                             let scheme = parsed_url.scheme().to_lowercase();
                             if (scheme == "http" || scheme == "https") && parsed_url.host_str().is_some() {
-                                info!("{} Possible absolute URI forward detected (cluster_id: {:?}, authority: {:?}). Original path: {}",
-                                    log_context!(self), self.context.cluster_id, self.context.authority, request_path_str);
-
-                                self.is_forward_proxy_request = true; // Mark as forward proxy request
+                                self.is_forward_proxy_request = true;
                                 self.forward_target_scheme = Some(scheme.clone());
                                 self.forward_target_host = parsed_url.host_str().map(|s| s.to_string());
                                 self.forward_target_port = parsed_url.port_or_known_default();
 
-                                // Update self.context.path to be the path & query part for the upstream.
                                 let upstream_path = if parsed_url.path().is_empty() { "/".to_string() } else { parsed_url.path().to_string() };
                                 let final_upstream_path = if let Some(query) = parsed_url.query() {
                                     format!("{}?{}", upstream_path, query)
@@ -597,10 +479,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                                 };
                                 self.context.path = Some(final_upstream_path);
 
-                                // Update self.context.authority to the host:port from the absolute URI.
-                                // This is critical for correct Host header generation if Sozu modifies/sends one,
-                                // and for consistent logging.
-                                let host_from_url = self.forward_target_host.as_ref().unwrap(); // Safe due to host_str().is_some()
+                                let host_from_url = self.forward_target_host.as_ref().unwrap();
                                 self.context.authority = if let Some(port) = self.forward_target_port {
                                     if (scheme == "http" && port != 80) || (scheme == "https" && port != 443) {
                                         Some(format!("{}:{}", host_from_url, port))
@@ -610,79 +489,57 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                                 } else {
                                     Some(host_from_url.clone())
                                 };
-
-                                info!(
-                                    "{} Absolute URI forward request. Original: '{}'. Parsed Target -> Scheme: {:?}, Host: {:?}, Port: {:?}. Context Path set to: {:?}. Context Authority set to: {:?}",
-                                    log_context!(self),
-                                    request_path_str,
-                                    self.forward_target_scheme,
-                                    self.forward_target_host,
-                                    self.forward_target_port,
-                                    self.context.path,
-                                    self.context.authority
-                                );
-                            } else {
-                                // Parsed but not http/https or no host, not a valid forward target.
-                                info!("{} Parsed URI '{}' but scheme ('{}') is not http/https or host is missing. Not treating as forward proxy.", log_context!(self), request_path_str, scheme);
+                                debug!("{} Absolute URI forward: target='{}://{}:{}', path='{}', authority='{}'",
+                                       log_context!(self), scheme, self.forward_target_host.as_deref().unwrap_or(""), self.forward_target_port.unwrap_or(0), self.context.path.as_deref().unwrap_or(""), self.context.authority.as_deref().unwrap_or(""));
                             }
                         }
                         Err(e) => {
-                            // Looked like an absolute URI but failed to parse.
-                            warn!("{} Failed to parse suspected absolute URI '{}': {}. Proceeding with normal reverse-proxy/backend logic.", log_context!(self), request_path_str, e);
+                            warn!("{} Failed to parse suspected absolute URI '{}': {}. Proceeding with normal logic.",
+                                  log_context!(self), request_path_str, e);
                         }
                     }
                 }
             }
-        }
-        // --- END FORWARD PROXY LOGIC (Absolute URI detection) ---
 
-        // --- BEGIN FORWARD PROXY LOGIC (CONNECT detection) ---
-        if !self.is_forward_proxy_request && // Not already identified as absolute URI forward
-           (self.request_stream.is_header_phase() || self.request_stream.is_main_phase()) &&
-           self.context.method == Some(Method::Connect) {
-
-            info!("{} CONNECT request detected.", log_context!(self));
-            self.is_forward_proxy_request = true; // Mark that we are handling a forward proxy style request
-
-            if let Some(authority_str) = self.context.authority.as_deref() {
-                let mut parts = authority_str.splitn(2, ':');
-                if let Some(host) = parts.next() {
-                    self.forward_target_host = Some(host.to_string());
-                    if let Some(port_str) = parts.next() {
-                        match port_str.parse::<u16>() {
-                            Ok(port) => self.forward_target_port = Some(port),
-                            Err(_) => {
-                                warn!("{} Invalid port in CONNECT authority: {}", log_context!(self), authority_str);
-                                self.set_answer(DefaultAnswer::Answer400 { message: "Invalid port in CONNECT authority".into(), phase: self.request_stream.parsing_phase.marker(), successfully_parsed: "".into(), partially_parsed: "".into(), invalid: authority_str.to_string() });
-                                return StateResult::Continue; // Proceed to send 400
-                            }
-                        }
-                    } else {
-                        // Default to 443 for CONNECT if no port is specified
-                        self.forward_target_port = Some(443);
-                        info!("{} No port in CONNECT authority '{}', defaulting to 443.", log_context!(self), authority_str);
+            // CONNECT method detection (only if not already identified as absolute URI forward)
+            if !self.is_forward_proxy_request && self.context.method == Some(Method::Connect) {
+                self.is_forward_proxy_request = true;
+                if let Some(authority_str) = self.context.authority.as_deref() {
+                    let mut parts = authority_str.splitn(2, ':');
+                    if let Some(host) = parts.next() {
+                        self.forward_target_host = Some(host.to_string());
+                        self.forward_target_port = parts.next().and_then(|p_str| p_str.parse::<u16>().ok()).or(Some(443)); // Default to 443
+                        self.forward_target_scheme = Some("tcp".to_string()); // Implicitly TCP for the tunnel
+                        debug!("{} CONNECT request: target_host='{:?}', target_port='{:?}'",
+                               log_context!(self), self.forward_target_host, self.forward_target_port);
+                    } else { // Invalid authority for CONNECT
+                        warn!("{} Invalid CONNECT authority: {}", log_context!(self), authority_str);
+                        // Store answer details and set later to avoid borrow issues
+                        let answer_details = DefaultAnswer::Answer400 {
+                            message: "Invalid CONNECT authority".into(),
+                            phase: self.request_stream.parsing_phase.marker(),
+                            successfully_parsed: "".into(),
+                            partially_parsed: "".into(),
+                            invalid: authority_str.to_string()
+                        };
+                        self.set_answer(answer_details);
+                        return StateResult::Continue; // Proceed to send 400
                     }
-                    self.forward_target_scheme = Some("tcp".to_string()); // Scheme is implicitly tcp for the tunnel
-
-                    info!(
-                        "{} CONNECT target parsed. Host: {:?}, Port: {:?}",
-                        log_context!(self),
-                        self.forward_target_host,
-                        self.forward_target_port
-                    );
-                    // Proceed to connection phase via ConnectBackend state
-                } else {
-                    warn!("{} Invalid CONNECT authority: {}", log_context!(self), authority_str);
-                    self.set_answer(DefaultAnswer::Answer400 { message: "Invalid CONNECT authority".into(), phase: self.request_stream.parsing_phase.marker(), successfully_parsed: "".into(), partially_parsed: "".into(), invalid: authority_str.to_string() });
+                } else { // CONNECT request must have an authority
+                    warn!("{} CONNECT request missing authority.", log_context!(self));
+                    let answer_details = DefaultAnswer::Answer400 {
+                        message: "CONNECT request missing authority".into(),
+                        phase: self.request_stream.parsing_phase.marker(),
+                        successfully_parsed: "".into(),
+                        partially_parsed: "".into(),
+                        invalid: "".to_string()
+                    };
+                    self.set_answer(answer_details);
                     return StateResult::Continue; // Proceed to send 400
                 }
-            } else {
-                warn!("{} CONNECT request missing authority.", log_context!(self));
-                self.set_answer(DefaultAnswer::Answer400 { message: "CONNECT request missing authority".into(), phase: self.request_stream.parsing_phase.marker(), successfully_parsed: "".into(), partially_parsed: "".into(), invalid: "".to_string() });
-                return StateResult::Continue; // Proceed to send 400
             }
         }
-        // --- END FORWARD PROXY LOGIC (CONNECT detection) ---
+        // --- END FORWARD PROXY LOGIC (Absolute URI and CONNECT detection in readable()) ---
 
         if was_initial && !self.request_stream.is_initial() {
             // if it was the first request, the front timeout duration
@@ -739,33 +596,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             if was_not_proxying {
                 // Sozu tries to connect only once all the headers were gathered and edited
                 // this could be improved
-                // If serving from cache, we don't connect to backend.
-                if self.current_cached_response_to_serve.is_some() {
-                    trace!("{} Serving from cache, skipping backend connection.", log_context!(self));
-                            self.frontend_readiness.interest.insert(Ready::WRITABLE); // Ensure writable to serve from cache
-                } else {
-                            // Not serving from cache, proceed to connect to backend.
-                            // Now is the time to set the definitive current_cache_key for potential storage later.
-                            if self.is_forward_proxy_request && self.context.method == Some(Method::Get) && !self.is_connect_tunnel {
-                                if let (Some(scheme), Some(host), Some(port), Some(path)) = (
-                                    self.forward_target_scheme.as_deref(),
-                                    self.forward_target_host.as_deref(),
-                                    self.forward_target_port,
-                                    self.context.path.as_deref(), // Use the normalized path
-                                ) {
-                                    let full_uri_for_cache = format!("{}://{}:{}{}", scheme, host, port, path);
-                                    self.current_cache_key = Some(format!("GET::{}", full_uri_for_cache));
-                                    info!("{} Cache key set for potential storage: {:?}", log_context!(self), self.current_cache_key);
-                                }
-                            } else if self.context.method == Some(Method::Get) && !self.is_connect_tunnel {
-                                // Fallback for non-absolute URI but potentially cacheable reverse proxy GETs (if desired later)
-                                // For now, this path means current_cache_key might remain None if not absolute forward.
-                            }
-
-
-                    trace!("{} ============== HANDLE CONNECTION!", log_context!(self));
-                    return StateResult::ConnectBackend;
-                }
+                trace!("{} ============== HANDLE CONNECTION!", log_context!(self));
+                return StateResult::ConnectBackend;
             }
         }
         if self.request_stream.is_terminated() {
@@ -777,206 +609,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     pub fn writable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
         trace!("{} ============== writable", log_context!(self));
-
-        // --- BEGIN CACHING (Serve from cache with partial write handling) ---
-        // This logic confirms and refines the stateful approach to serving cached responses,
-        // ensuring partial writes of the body are handled by retaining state and continuing on subsequent calls.
-        // The item is taken from self.current_cached_response_to_serve.
-        // If not fully sent due to WouldBlock, it's put back.
-        // If an error occurs, it's dropped and state is reset.
-        // If fully sent, it's consumed and state is reset.
-        if self.current_cached_response_to_serve.is_some() {
-            // Take ownership of the cached item. It's put back if not fully sent and no fatal error.
-            if let Some(cached_item) = self.current_cached_response_to_serve.take() { // Renamed for clarity
-
-                // Phase 1: Send headers if not already sent
-                if !self.cached_response_headers_sent {
-                    let mut header_string = format!("HTTP/1.1 {}\r\n", cached_item.status);
-                    let mut content_length_present = false;
-                    let mut transfer_encoding_chunked = false;
-                    for (name, value) in &cached_item.headers {
-                        header_string.push_str(&format!("{}: {}\r\n", name, value));
-                        if name.eq_ignore_ascii_case("Content-Length") { content_length_present = true; }
-                        if name.eq_ignore_ascii_case("Transfer-Encoding") && value.eq_ignore_ascii_case("chunked") { transfer_encoding_chunked = true; }
-                    }
-                    if !cached_item.body.is_empty() && !content_length_present && !transfer_encoding_chunked {
-                        header_string.push_str(&format!("Content-Length: {}\r\n", cached_item.body.len()));
-                    }
-                    header_string.push_str("\r\n");
-
-                    let header_bytes = header_string.as_bytes();
-                    let (header_write_size, header_socket_state) = self.frontend_socket.socket_write_vectored(&[std::io::IoSlice::new(header_bytes)]);
-
-                    match header_socket_state {
-                        SocketResult::Error | SocketResult::Closed => {
-                            self.frontend_socket.write_error();
-                            self.log_request_error(metrics, "Front socket error/closed while writing cached headers.");
-                            self.cached_response_headers_sent = false; // Reset state
-                            self.cached_response_body_bytes_written = 0;
-                            // current_cached_response_to_serve already taken and not put back
-                            return StateResult::CloseSession;
-                        }
-                        SocketResult::WouldBlock => {
-                            self.frontend_readiness.event.remove(Ready::WRITABLE);
-                            self.current_cached_response_to_serve = Some(cached_item); // Put it back, headers not sent
-                            return StateResult::Continue;
-                        }
-                        SocketResult::Continue => {
-                            if header_write_size < header_bytes.len() {
-                                // Partial header write is treated as an error for simplicity.
-                                error!("{} Partial write of cached headers ({} of {} bytes). Closing session.",
-                                    log_context!(self), header_write_size, header_bytes.len());
-                                self.log_request_error(metrics, "Partial write of cached headers");
-                                self.cached_response_headers_sent = false;
-                                self.cached_response_body_bytes_written = 0;
-                                return StateResult::CloseSession;
-                            }
-                            self.cached_response_headers_sent = true;
-                            info!("{} Successfully sent cached headers.", log_context!(self));
-                            // If body is empty, we are done after sending headers.
-                            if cached_item.body.is_empty() {
-                                // Fall through to Phase 3 completion logic directly.
-                            } else {
-                                // Headers sent, body is not empty. Put item back for body sending phase.
-                                self.current_cached_response_to_serve = Some(cached_item);
-                                self.frontend_readiness.interest.insert(Ready::WRITABLE); // Ensure writable for body
-                                return StateResult::Continue;
-                            }
-                        }
-                    }
-                }
-
-                // `cached_item` was taken at the start of the `if let Some...` block.
-                // If execution reaches here, it means either headers were just fully sent,
-                // or they were sent in a previous call.
-                // We need to use the `cached_item` that was taken.
-                let mut item_being_served = cached_item;
-
-
-                // Phase 2: Send body if headers have been successfully sent
-                if self.cached_response_headers_sent {
-                    if self.cached_response_body_bytes_written < item_being_served.body.len() {
-                        let body_slice_to_send = &item_being_served.body[self.cached_response_body_bytes_written..];
-
-                        if !body_slice_to_send.is_empty() {
-                            let (body_write_size, body_socket_state) = self.frontend_socket.socket_write_vectored(&[std::io::IoSlice::new(body_slice_to_send)]);
-
-                            if body_write_size > 0 {
-                                self.cached_response_body_bytes_written += body_write_size;
-                                count!("bytes_out", body_write_size as i64);
-                                metrics.bout += body_write_size;
-                            }
-
-                            match body_socket_state {
-                                SocketResult::Error | SocketResult::Closed => {
-                                    self.frontend_socket.write_error();
-                                    self.log_request_error(metrics, "Front socket error/closed while writing cached body.");
-                                    self.cached_response_headers_sent = false;
-                                    self.cached_response_body_bytes_written = 0;
-                                    return StateResult::CloseSession;
-                                }
-                                SocketResult::WouldBlock => {
-                                    self.frontend_readiness.event.remove(Ready::WRITABLE);
-                                    self.current_cached_response_to_serve = Some(item_being_served); // Put it back
-                                    return StateResult::Continue;
-                                }
-                                SocketResult::Continue => {
-                                    if self.cached_response_body_bytes_written < item_being_served.body.len() {
-                                        self.frontend_readiness.interest.insert(Ready::WRITABLE);
-                                        self.current_cached_response_to_serve = Some(item_being_served); // Put it back
-                                        return StateResult::Continue;
-                                    }
-                                    // Else, all body written, fall through to completion.
-                                }
-                            }
-                        }
-                    }
-
-                    // Phase 3: Check for completion (headers sent and all body bytes written)
-                    if self.cached_response_headers_sent && self.cached_response_body_bytes_written == item_being_served.body.len() {
-                        info!("{} Successfully served complete response from cache.", log_context!(self));
-                        self.log_request_success(metrics);
-
-                        let closing = self.context.closing || !self.context.keep_alive_frontend;
-                        // State (current_cached_response_to_serve, headers_sent, body_bytes_written)
-                        // will be fully reset by Http::reset() if keep-alive.
-
-                        if closing {
-                            return StateResult::CloseSession;
-                        } else {
-                            metrics.reset();
-                            self.reset();
-                            return StateResult::Continue;
-                        }
-                    }
-                }
-                // Fallback: If for some reason the item wasn't fully processed and not put back by an early return,
-                // ensure it's put back if there's still work to do.
-                if self.current_cached_response_to_serve.is_none() &&
-                   (!self.cached_response_headers_sent || self.cached_response_body_bytes_written < item_being_served.body.len()) {
-                     self.current_cached_response_to_serve = Some(item_being_served);
-                }
-                return StateResult::Continue;
-            }
-        }
-        // --- END CACHING (Serve from cache with partial write handling) ---
-
         let response_stream = match &mut self.response_stream {
-            ResponseStream::BackendAnswer(response_stream) => {
-                // --- BEGIN CACHING (Population) ---
-                // This logic should run when the response from origin is complete.
-                if response_stream.is_terminated() && response_stream.is_completed() {
-                    if let Some(key_to_cache) = self.current_cache_key.take() { // .take() to only attempt cache once per request
-                        if self.context.status == Some(200) { // Only cache 200 OK for now
-                            let mut can_cache_response = true;
-                            let mut extracted_headers = Vec::new();
-
-                            // Check server response headers for Cache-Control directives
-                            for header in response_stream.detached.headers.iter() {
-                                let name_str = String::from_utf8_lossy(header.name());
-                                let value_str = String::from_utf8_lossy(header.value());
-
-                                if name_str.eq_ignore_ascii_case("Cache-Control") {
-                                    if value_str.contains("no-store") || value_str.contains("private") {
-                                        can_cache_response = false;
-                                        info!("{} Origin response for key '{}' contains Cache-Control: no-store/private. Not caching.", log_context!(self), key_to_cache);
-                                        break;
-                                    }
-                                    // Basic max-age=0 check (more complex parsing needed for full support)
-                                    if value_str.contains("max-age=0") {
-                                         can_cache_response = false;
-                                         info!("{} Origin response for key '{}' contains Cache-Control: max-age=0. Not caching.", log_context!(self), key_to_cache);
-                                         break;
-                                    }
-                                }
-                                // TODO: Could also check 'Pragma: no-cache' from origin, though less common for responses.
-                                // TODO: Could check 'Expires' header for very old dates.
-
-                                extracted_headers.push((name_str.into_owned(), value_str.into_owned()));
-                            }
-
-                            if can_cache_response {
-                                let body_to_cache = response_stream.storage.used().to_vec();
-                                let item_to_cache = CachedResponse {
-                                    status: 200, // We already checked self.context.status == Some(200)
-                                    headers: extracted_headers,
-                                    body: body_to_cache,
-                                };
-                                if let Ok(mut cache) = HTTP_FORWARD_CACHE.lock() {
-                                    cache.put(key_to_cache.clone(), item_to_cache);
-                                    info!("{} Response for key {} cached.", log_context!(self), key_to_cache);
-                                } else {
-                                    error!("{} Failed to lock cache for writing.", log_context!(self));
-                                }
-                            }
-                        } else {
-                             info!("{} Response status {:?} for key {:?} not 200 OK. Not caching.", log_context!(self), self.context.status, key_to_cache);
-                        }
-                    }
-                }
-                // --- END CACHING (Population) ---
-                response_stream // return for outer match
-            },
+            ResponseStream::BackendAnswer(response_stream) => response_stream,
             _ => return self.writable_default_answer(metrics),
         };
 
@@ -1365,7 +999,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 }
 
-impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
+impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
     fn log_endpoint(&self) -> EndpointRecord {
         EndpointRecord::Http {
             method: self.context.method.as_deref(),
@@ -1842,6 +1476,175 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         Ok(conn)
     }
 
+    // Removed unused helper method response_stream_storage_mut
+    // Its logic was inlined into handle_connect_tunnel to resolve borrow checker issues.
+
+    /// Generic helper for transferring data in tunnel mode.
+    /// Returns `Ok(true)` if EOF or error occurred on source/destination, indicating session should close.
+    /// Returns `Ok(false)` if data was transferred or a socket would block (session continues).
+    /// Returns `Err(_)` for critical internal errors (e.g., trying to use DefaultAnswer stream).
+    fn transfer_data<S1, S2>( // Removed &self
+        log_context_str: &str, // Added log_context_str
+        source_socket_handler: &mut S1,
+        dest_socket_handler: &mut S2,
+        buffer_checkout: &mut kawa::Buffer<Checkout>,
+        metrics: &mut SessionMetrics,
+        is_front_to_back: bool
+    ) -> Result<bool, ()>
+    where
+        S1: SocketHandler + std::fmt::Debug,
+        S2: SocketHandler + std::fmt::Debug,
+    {
+        let mut eof_or_error_occurred = false;
+
+        // Step 1: Try to write any pending data from the buffer to the destination socket.
+        if !buffer_checkout.is_empty() {
+            let (write_size, write_state) = dest_socket_handler.socket_write_vectored(&[std::io::IoSlice::new(buffer_checkout.used())]);
+            if write_size > 0 {
+                buffer_checkout.consume(write_size);
+                if is_front_to_back {
+                    metrics.backend_bout += write_size; count!("connect.front_to_back_bytes_written", write_size as i64);
+                    trace!("{} CONNECT tunnel: Wrote {} bytes from client to target.", log_context_str, write_size);
+                } else {
+                    metrics.bout += write_size; count!("connect.back_to_front_bytes_written", write_size as i64);
+                    trace!("{} CONNECT tunnel: Wrote {} bytes from target to client.", log_context_str, write_size);
+                }
+            }
+            match write_state {
+                SocketResult::WouldBlock => { /* Destination would block, can't write more now. */ }
+                SocketResult::Error | SocketResult::Closed => {
+                    let direction = if is_front_to_back { "dest (target)" } else { "dest (client)" };
+                    info!("{} CONNECT tunnel: {} socket error/closed on write. Marking for session closure.", log_context_str, direction);
+                    eof_or_error_occurred = true;
+                }
+                SocketResult::Continue => {}
+            }
+        }
+
+        // Step 2: If the buffer has space AND no error occurred on write yet, try to read from the source socket.
+        if !eof_or_error_occurred && !buffer_checkout.is_full() {
+             let (read_size, read_state) = source_socket_handler.socket_read(buffer_checkout.space());
+             if read_size > 0 {
+                buffer_checkout.fill(read_size);
+                if is_front_to_back {
+                    metrics.bin += read_size; count!("connect.front_to_back_bytes_read", read_size as i64);
+                    trace!("{} CONNECT tunnel: Read {} bytes from client.", log_context_str, read_size);
+                } else {
+                    metrics.backend_bin += read_size; count!("connect.back_to_front_bytes_read", read_size as i64);
+                    trace!("{} CONNECT tunnel: Read {} bytes from target.", log_context_str, read_size);
+                }
+             }
+            match read_state {
+                SocketResult::WouldBlock => { /* Source would block, can't read more now. */ }
+                SocketResult::Error | SocketResult::Closed => {
+                    let direction = if is_front_to_back { "source (client)" } else { "source (target)" };
+                    info!("{} CONNECT tunnel: {} socket EOF/error/closed on read. Marking for session closure.", log_context_str, direction);
+                    eof_or_error_occurred = true;
+                }
+                SocketResult::Continue => {}
+            }
+        }
+
+        Ok(eof_or_error_occurred)
+    }
+
+    fn handle_connect_tunnel(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        let mut close_session = false;
+        let mut activity_occurred_in_pass = true;
+
+        for _ in 0..MAX_LOOP_ITERATIONS {
+            if !activity_occurred_in_pass {
+                break;
+            }
+            activity_occurred_in_pass = false;
+
+            // Try client to target
+            if self.frontend_readiness.event.is_readable() || !self.request_stream.storage.is_empty() {
+                if self.backend_socket.is_some() {
+                    let log_str = log_context!(self); // Pre-generate log string
+                    let frontend_sock_mut = &mut self.frontend_socket;
+                    let backend_sock_mut = self.backend_socket.as_mut().unwrap();
+                    let request_storage_mut = &mut self.request_stream.storage;
+                    match Self::transfer_data(&log_str, frontend_sock_mut, backend_sock_mut, request_storage_mut, metrics, true) {
+                        Ok(should_close) => {
+                            if should_close { close_session = true; }
+                            if !should_close { activity_occurred_in_pass = true; }
+                        }
+                        Err(_) => { close_session = true; }
+                    }
+                } else {
+                    // log_context!(self) is safe here as no conflicting mutable borrows are active
+                    info!("{} CONNECT tunnel: Backend socket missing for front->back transfer. Closing.", log_context!(self));
+                    close_session = true;
+                }
+            }
+            if close_session { break; }
+
+            // Try target to client
+            let initial_backend_readable_event = self.backend_readiness.event.is_readable();
+            let initial_response_storage_not_empty = match &self.response_stream {
+                ResponseStream::BackendAnswer(s) => !s.storage.is_empty(),
+                ResponseStream::DefaultAnswer(_, _) => false,
+            };
+
+            if initial_backend_readable_event || initial_response_storage_not_empty {
+                if self.backend_socket.is_some() {
+                    let log_str = log_context!(self); // Create log_str based on current state.
+                                                      // Immutable borrows for log_str are established.
+                    match &mut self.response_stream {
+                        ResponseStream::BackendAnswer(rs) => {
+                            let response_storage_checkout = &mut rs.storage;
+                            // Condition to call transfer_data: backend must be readable OR the buffer must have data.
+                            // We use initial_backend_readable_event and check response_storage_checkout directly.
+                            if initial_backend_readable_event || !response_storage_checkout.is_empty() {
+                                let backend_sock_mut = self.backend_socket.as_mut().unwrap();
+                                let frontend_sock_mut = &mut self.frontend_socket;
+                                match Self::transfer_data(&log_str, backend_sock_mut, frontend_sock_mut, response_storage_checkout, metrics, false) {
+                                    Ok(should_close) => {
+                                        if should_close { close_session = true; }
+                                        if !should_close { activity_occurred_in_pass = true; }
+                                    }
+                                    Err(_) => { close_session = true; }
+                                }
+                            }
+                        }
+                        ResponseStream::DefaultAnswer(_, _) => {
+                            error!("{} Attempted to get response_storage_checkout during DefaultAnswer state (likely in tunnel mode error).", log_context!(self));
+                            close_session = true;
+                        }
+                    }
+                } else {
+                    info!("{} CONNECT tunnel: Backend socket missing for back->front transfer. Closing.", log_context!(self));
+                    close_session = true;
+                }
+            }
+            if close_session { break; }
+
+            if !self.frontend_readiness.event.is_readable() && !self.backend_readiness.event.is_readable() && !activity_occurred_in_pass {
+                break;
+            }
+        }
+
+        if self.frontend_readiness.event.is_hup() || self.frontend_readiness.event.is_error() {
+            info!("{} CONNECT tunnel: Frontend HUP/Error detected. Closing session.", log_context!(self));
+            close_session = true;
+        }
+        if self.backend_readiness.event.is_hup() || self.backend_readiness.event.is_error() {
+            info!("{} CONNECT tunnel: Backend HUP/Error detected. Closing session.", log_context!(self));
+            close_session = true;
+        }
+
+        self.frontend_readiness.event = Ready::EMPTY;
+        self.backend_readiness.event = Ready::EMPTY;
+
+        if close_session {
+            info!("{} CONNECT tunnel: Closing session due to detected error or EOF.", log_context!(self));
+            SessionResult::Close
+        } else {
+            SessionResult::Continue
+        }
+    }
+
     fn get_backend_for_sticky_session(
         &self,
         frontend_should_stick: bool,
@@ -1863,167 +1666,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    /// Helper to get mutable access to response_stream's storage, if it's BackendAnswer.
-    /// Needed for `transfer_data` because `ResponseStream` is an enum.
-    fn response_stream_storage_mut(&mut self) -> Result<&mut kawa::Buffer<Checkout>, ()> {
-        match &mut self.response_stream {
-            ResponseStream::BackendAnswer(rs) => Ok(&mut rs.storage),
-            ResponseStream::DefaultAnswer(_, _) => {
-                error!("{} Attempted to get response_stream_storage_mut during DefaultAnswer state (likely in tunnel mode error).", log_context!(self));
-                Err(())
-            }
-        }
-    }
-
-    /// Generic helper for transferring data in tunnel mode.
-    /// Returns `Ok(true)` if EOF or error occurred on source/destination, indicating session should close.
-    /// Returns `Ok(false)` if data was transferred or a socket would block (session continues).
-    /// Returns `Err(_)` for critical internal errors (e.g., trying to use DefaultAnswer stream).
-    fn transfer_data<S1, S2>(&mut self,
-        source_socket_handler: &mut S1, // Renamed to avoid conflict with Http.source_socket
-        dest_socket_handler: &mut S2,   // Renamed to avoid conflict
-        buffer_checkout: &mut kawa::Buffer<Checkout>,
-        metrics: &mut SessionMetrics,
-        is_front_to_back: bool
-    ) -> Result<bool, ()>
-    where
-        S1: SocketHandler + std::fmt::Debug,
-        S2: SocketHandler + std::fmt::Debug,
-    {
-        let mut eof_or_error_occurred = false;
-
-        // Step 1: Try to write any pending data from the buffer to the destination socket.
-        if !buffer_checkout.is_empty() {
-            let (write_size, write_state) = dest_socket_handler.socket_write_vectored(&[std::io::IoSlice::new(buffer_checkout.used())]);
-            if write_size > 0 {
-                buffer_checkout.consume(write_size);
-                if is_front_to_back {
-                    metrics.backend_bout += write_size; count!("connect.front_to_back_bytes_written", write_size as i64);
-                    trace!("{} CONNECT tunnel: Wrote {} bytes from client to target.", log_context!(self), write_size);
-                } else {
-                    metrics.bout += write_size; count!("connect.back_to_front_bytes_written", write_size as i64);
-                    trace!("{} CONNECT tunnel: Wrote {} bytes from target to client.", log_context!(self), write_size);
-                }
-            }
-            match write_state {
-                SocketResult::WouldBlock => { /* Destination would block, can't write more now. */ }
-                SocketResult::Error | SocketResult::Closed => {
-                    let direction = if is_front_to_back { "dest (target)" } else { "dest (client)" };
-                    info!("{} CONNECT tunnel: {} socket error/closed on write. Marking for session closure.", log_context!(self), direction);
-                    eof_or_error_occurred = true; // Mark to close session after attempting read from source.
-                }
-                SocketResult::Continue => {}
-            }
-        }
-
-        // Step 2: If the buffer has space AND no error occurred on write, try to read from the source socket.
-        if !eof_or_error_occurred && !buffer_checkout.is_full() {
-             let (read_size, read_state) = source_socket_handler.socket_read(buffer_checkout.space());
-             if read_size > 0 {
-                buffer_checkout.fill(read_size);
-                if is_front_to_back {
-                    metrics.bin += read_size; count!("connect.front_to_back_bytes_read", read_size as i64);
-                    trace!("{} CONNECT tunnel: Read {} bytes from client.", log_context!(self), read_size);
-                } else {
-                    metrics.backend_bin += read_size; count!("connect.back_to_front_bytes_read", read_size as i64);
-                    trace!("{} CONNECT tunnel: Read {} bytes from target.", log_context!(self), read_size);
-                }
-             }
-            match read_state {
-                SocketResult::WouldBlock => { /* Source would block, can't read more now. */ }
-                SocketResult::Error | SocketResult::Closed => { // EOF or error on source
-                    let direction = if is_front_to_back { "source (client)" } else { "source (target)" };
-                    info!("{} CONNECT tunnel: {} socket EOF/error/closed on read. Marking for session closure.", log_context!(self), direction);
-                    eof_or_error_occurred = true;
-                }
-                SocketResult::Continue => {}
-            }
-        }
-
-        Ok(eof_or_error_occurred)
-    }
-
-    fn handle_connect_tunnel(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        let mut close_session = false;
-        let mut activity_occured = true; // Assume activity to enter loop
-
-        // Loop to shuttle data as long as there's activity or events suggesting potential activity
-        for _ in 0..MAX_LOOP_ITERATIONS { // Protect against potential spin loops
-            if !activity_occured { // No data moved in the last full pass, and no new events processed by now.
-                break;
-            }
-            activity_occured = false; // Reset for this pass
-
-            // 1. Data from client (frontend) to target (backend)
-            // Try to transfer if frontend was readable OR if there's pending data in request_stream buffer.
-            if self.frontend_readiness.event.is_readable() || !self.request_stream.storage.is_empty() {
-                if self.backend_socket.is_some() { // Ensure backend socket exists
-                    match self.transfer_data(&mut self.frontend_socket, self.backend_socket.as_mut().unwrap(), &mut self.request_stream.storage, metrics, true) {
-                        Ok(should_close) => {
-                            if should_close { close_session = true; break; }
-                            activity_occured = true; // transfer_data would have returned false if it just blocked
-                        }
-                        Err(_) => { close_session = true; break; } // Internal error from transfer_data itself
-                    }
-                } else {
-                    info!("{} CONNECT tunnel: Backend socket missing for front->back transfer. Closing.", log_context!(self));
-                    close_session = true; break;
-                }
-            }
-            if close_session { break; }
-
-
-            // 2. Data from target (backend) to client (frontend)
-            // Try to transfer if backend was readable OR if there's pending data in response_stream buffer.
-            let response_storage_checkout = match self.response_stream_storage_mut() {
-                Ok(s) => s,
-                Err(_) => { close_session = true; break; } // Should not happen if tunnel is properly established
-            };
-            if self.backend_readiness.event.is_readable() || !response_storage_checkout.is_empty() {
-                 if self.backend_socket.is_some() { // Ensure backend socket exists (already checked for write, but good for read source)
-                    match self.transfer_data(self.backend_socket.as_mut().unwrap(), &mut self.frontend_socket, response_storage_checkout, metrics, false) {
-                        Ok(should_close) => {
-                            if should_close { close_session = true; break; }
-                            activity_occured = true;
-                        }
-                        Err(_) => { close_session = true; break; }
-                    }
-                } else {
-                     info!("{} CONNECT tunnel: Backend socket missing for back->front transfer. Closing.", log_context!(self));
-                    close_session = true; break;
-                }
-            }
-            if close_session { break; }
-
-            // If after trying both directions, no new events were processed by this iteration of the loop for readable,
-            // and no data could be moved (e.g. both directions would block on write or read with empty buffers), then break.
-            if !self.frontend_readiness.event.is_readable() && !self.backend_readiness.event.is_readable() && !activity_occured {
-                break;
-            }
-        }
-
-        // Final check for HUP/Error events after data shuttling attempts
-        if self.frontend_readiness.event.is_hup() || self.frontend_readiness.event.is_error() {
-            info!("{} CONNECT tunnel: Frontend HUP/Error detected post-transfer. Closing session.", log_context!(self));
-            close_session = true;
-        }
-        if self.backend_readiness.event.is_hup() || self.backend_readiness.event.is_error() {
-            info!("{} CONNECT tunnel: Backend HUP/Error detected post-transfer. Closing session.", log_context!(self));
-            close_session = true;
-        }
-
-        // Clear Mio events as they've been processed for this tunnel iteration
-        self.frontend_readiness.event = Ready::EMPTY;
-        self.backend_readiness.event = Ready::EMPTY;
-
-        if close_session {
-            info!("{} CONNECT tunnel: Closing session.", log_context!(self));
-            SessionResult::Close
-        } else {
-            SessionResult::Continue
-        }
-    }
-
     fn connect_to_backend(
         &mut self,
         session_rc: Rc<RefCell<dyn ProxySession>>,
@@ -2034,31 +1676,29 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         if self.is_forward_proxy_request && !self.is_connect_tunnel {
             debug!("{} Attempting direct connection for HTTP forward proxy.", log_context!(self));
 
-            let target_host = self.forward_target_host.as_ref().ok_or_else(|| {
-                self.set_answer(DefaultAnswer::Answer503 { message: "Forward proxy host not set.".into() });
-                BackendConnectionError::Backend(BackendError::NoHealthyBackends("Forward proxy host not set.".into()))
+            let target_host = self.forward_target_host.as_ref().cloned().ok_or_else(|| {
+                // Changed to NoBackendForCluster as per previous discussions on error types
+                BackendConnectionError::Backend(BackendError::NoBackendForCluster("Forward proxy host not set for direct connection.".into()))
             })?;
             let target_port = self.forward_target_port.ok_or_else(|| {
-                self.set_answer(DefaultAnswer::Answer503 { message: "Forward proxy port not set.".into() });
-                BackendConnectionError::Backend(BackendError::NoHealthyBackends("Forward proxy port not set.".into()))
+                BackendConnectionError::Backend(BackendError::NoBackendForCluster("Forward proxy port not set for direct connection.".into()))
             })?;
 
             let target_addr_str = format!("{}:{}", target_host, target_port);
+            let target_socket_addr: SocketAddr = target_addr_str.parse().map_err(|e| {
+                warn!("{} Failed to parse forward proxy address '{}': {}", log_context!(self), target_addr_str, e);
+                BackendConnectionError::Backend(BackendError::NoBackendForCluster(format!("Forward proxy address invalid for direct connection: {}", target_addr_str)))
+            })?;
 
-            // Close any existing backend connection if we're switching to a direct forward.
-            // This mirrors logic for when cluster_id changes.
             if self.backend_token.take().is_some() {
                  self.close_backend(proxy.clone(), metrics);
             }
-            // Reset parts of context that might be tied to a previous backend/cluster.
-            self.context.cluster_id = Some(format!("forward_http->{}", target_addr_str)); // Synthetic cluster_id for logging
-            self.context.backend_id = Some(target_addr_str.clone()); // Synthetic backend_id
-            self.backend = None; // No traditional Backend object for direct forwards.
+            // Use a descriptive, unique cluster_id for logging/metrics for this forwarded connection
+            self.context.cluster_id = Some(format!("forward_proxy->{}", target_addr_str));
+            self.context.backend_id = Some(target_addr_str.clone()); // Use the target as backend_id
+            self.backend = None; // No traditional Sozu Backend object for direct forwards.
 
-            match TcpStream::connect(target_addr_str.parse().map_err(|_| {
-                self.set_answer(DefaultAnswer::Answer503 { message: "Forward proxy address invalid.".into() });
-                BackendConnectionError::Backend(BackendError::NoHealthyBackends("Forward proxy address invalid.".into()))
-            })?) {
+            match TcpStream::connect(target_socket_addr) {
                 Ok(mut stream) => {
                     info!("{} Successfully connected to forward target: {}", log_context!(self), target_addr_str);
                     if let Err(e) = stream.set_nodelay(true) {
@@ -2067,30 +1707,30 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
                     self.backend_readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
                     self.backend_connection_status = BackendConnectionStatus::Connecting(Instant::now());
-                    self.connection_attempts = 0; // Reset connection attempts for this new target.
+                    self.connection_attempts = 0;
 
-                    // Handle backend token (reuse or new)
-                    let old_backend_token = self.backend_token.take(); // Take to ensure it's processed once
+                    let old_backend_token = self.backend_token.take();
                     match old_backend_token {
                         Some(backend_token) => {
                             self.set_backend_token(backend_token);
+                            // Use register_socket as reregister_socket might not exist or be appropriate.
+                            // Assumes close_backend handled deregistration if necessary.
                             if let Err(e) = proxy.borrow().register_socket(&mut stream, backend_token, Interest::READABLE | Interest::WRITABLE) {
-                                error!("{} Error re-registering back socket for forward proxy({:?}): {:?}", log_context!(self), stream, e);
-                                // This is problematic, might need to close.
-                                return Err(BackendConnectionError::Backend(BackendError::InternalError(e.to_string())));
+                                error!("{} Error re-registering (as register) back socket for forward proxy({:?}): {:?}", log_context!(self), stream, e);
+                                return Err(BackendConnectionError::Backend(BackendError::MioConnection(e)));
                             }
-                            self.set_backend_socket(stream, None); // No traditional Backend object
+                            self.set_backend_socket(stream, None);
                             self.set_backend_timeout(self.configured_connect_timeout);
                             return Ok(BackendConnectAction::Replace);
                         }
                         None => {
-                            let backend_token = proxy.borrow().add_session(session_rc);
+                            let backend_token = proxy.borrow().add_session(session_rc.clone()); // Clone session_rc
                             if let Err(e) = proxy.borrow().register_socket(&mut stream, backend_token, Interest::READABLE | Interest::WRITABLE) {
                                 error!("{} Error registering new back socket for forward proxy({:?}): {:?}", log_context!(self), stream, e);
-                                proxy.borrow().remove_session(backend_token); // Clean up session entry
-                                return Err(BackendConnectionError::Backend(BackendError::InternalError(e.to_string())));
+                                proxy.borrow().remove_session(backend_token);
+                                return Err(BackendConnectionError::Backend(BackendError::MioConnection(e)));
                             }
-                            self.set_backend_socket(stream, None); // No traditional Backend object
+                            self.set_backend_socket(stream, None);
                             self.set_backend_token(backend_token);
                             self.set_backend_timeout(self.configured_connect_timeout);
                             return Ok(BackendConnectAction::New);
@@ -2099,9 +1739,15 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 }
                 Err(e) => {
                     error!("{} Failed to connect to forward target {}: {}", log_context!(self), target_addr_str, e);
-                    self.fail_backend_connection(metrics); // Uses self.backend, which is None. This might need adjustment or be a no-op.
                     self.set_answer(DefaultAnswer::Answer503 { message: format!("Failed to connect to upstream server: {}", target_host) });
-                    return Err(BackendConnectionError::Backend(BackendError::ConnectionRefusedOrTimedOut));
+                    return Err(BackendConnectionError::Backend(
+                        BackendError::ConnectionFailures {
+                            cluster_id: self.context.cluster_id.clone().unwrap_or_default(),
+                            backend_address: target_socket_addr,
+                            failures: 1,
+                            error: e.to_string()
+                        }
+                    ));
                 }
             }
         }
@@ -2112,13 +1758,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         self.check_circuit_breaker()?;
 
-        // This part is skipped for forward proxy requests handled above.
+        // This part is skipped for forward proxy requests handled by the block above.
         let cluster_id = self
             .cluster_id_from_request(proxy.clone())
             .map_err(BackendConnectionError::RetrieveClusterError)?;
 
         trace!(
-            "{} Connect_to_backend (reverse proxy): {:?} {:?} {:?}",
+            "{} Connect_to_backend: {:?} {:?} {:?}",
             log_context!(self),
             self.context.cluster_id,
             cluster_id,
@@ -2323,7 +1969,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    pub fn backend_hup(&mut self, metrics: &mut SessionMetrics) -> StateResult {
+    pub fn backend_hup(&mut self, _metrics: &mut SessionMetrics) -> StateResult {
         let response_stream = match &mut self.response_stream {
             ResponseStream::BackendAnswer(response_stream) => response_stream,
             _ => return StateResult::CloseBackend,
@@ -2403,42 +2049,41 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         proxy: Rc<RefCell<dyn L7Proxy>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
-        // --- BEGIN FORWARD PROXY (CONNECT Tunnel main dispatch) ---
+        // --- BEGIN FORWARD PROXY (CONNECT Tunnel main dispatch in ready_inner) ---
         if self.is_connect_tunnel {
-            // We are in CONNECT tunnel mode. Bypass normal HTTP processing.
+            // If already in tunnel mode, just shuttle data.
             return self.handle_connect_tunnel(metrics);
         }
         // --- END FORWARD PROXY (CONNECT Tunnel main dispatch) ---
 
-        // --- BEGIN FORWARD PROXY (CONNECT Tunnel Handling Setup) ---
+        // --- BEGIN FORWARD PROXY (CONNECT Tunnel Handling Setup in ready_inner) ---
         // Check if we've just successfully connected to the target for a CONNECT request.
-        if self.is_forward_proxy_request && // It's a forward proxy operation (CONNECT or absolute URI)
-           self.context.method == Some(Method::Connect) && // Specifically a CONNECT method
+        // This happens after connect_to_backend was called and Mio reported an event for the backend socket.
+        if self.is_forward_proxy_request &&
+           self.context.method == Some(Method::Connect) &&
            !self.is_connect_tunnel && // Not yet in tunnel mode
            self.connect_response_buffer.is_none() && // We haven't prepared the 200 OK yet
-           self.backend_connection_status.is_connecting() && // We were attempting to connect
-           !self.backend_readiness.event.is_empty() && // There's an event for the backend socket
-           !self.backend_readiness.event.is_hup() && // And it's not a hangup
-           !self.backend_readiness.event.is_error() // And it's not an error
-           // This implies the backend socket is now writable or readable, meaning TCP connect succeeded.
+           self.backend_connection_status == BackendConnectionStatus::Connected && // Ensure we are actually connected
+           !self.backend_readiness.event.is_empty() && // There's an event
+           !self.backend_readiness.event.is_hup() &&
+           !self.backend_readiness.event.is_error()
+           // Note: == BackendConnectionStatus::Connected is used now
+           // would have been called by the logic that processes the successful connection event.
         {
             info!("{} TCP connection to target for CONNECT successful. Preparing '200 Connection established'.", log_context!(self));
             self.connect_response_buffer = Some(b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec());
-            self.frontend_readiness.interest.insert(Ready::WRITABLE); // Ensure writable() is called to send this.
 
-            // Mark backend as "connected" for internal state management (e.g. timeouts)
-            // This doesn't mean it's an HTTP backend in the traditional sense for CONNECT.
-            metrics.backend_connected();
-            self.connection_attempts = 0; // Reset for this connection
-            self.set_backend_connected(BackendConnectionStatus::Connected, metrics); // Update status
+            // Ensure Http::writable() is called to send this response.
+            self.frontend_readiness.interest.insert(Ready::WRITABLE);
+            self.frontend_readiness.event.insert(Ready::WRITABLE); // Simulate event if not already there.
 
-            // For CONNECT, after 200 OK, we don't do further HTTP processing on this connection.
-            // So, remove interest in reading more from client (until tunnel starts) or writing to backend (HTTP-wise).
+            // For CONNECT, after 200 OK is sent, we don't do further HTTP processing on this connection from client.
+            // Interest in reading from client will be re-enabled by tunnel logic if needed.
             self.frontend_readiness.interest.remove(Ready::READABLE);
-            self.backend_readiness.interest.remove(Ready::WRITABLE | Ready::READABLE);
+            // Backend socket is now for tunneling, not HTTP.
+            self.backend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR; // Ready for tunnel reads
 
-            // Clear current events as we've handled the successful connection event for CONNECT.
-            self.frontend_readiness.event = Ready::EMPTY;
+            // Clear current backend Mio events as they've been processed for this CONNECT setup.
             self.backend_readiness.event = Ready::EMPTY;
 
             return SessionResult::Continue; // Let Http::writable send the 200 OK.
@@ -2449,8 +2094,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         if self.backend_connection_status.is_connecting()
             && !self.backend_readiness.event.is_empty()
-            // Add check to ensure this block is not entered if we just handled CONNECT success above
-            && !(self.context.method == Some(Method::Connect) && self.is_forward_proxy_request && self.connect_response_buffer.is_some())
         {
             if self.backend_readiness.event.is_hup() && !self.test_backend_socket() {
                 //retry connecting the backend
@@ -2647,7 +2290,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 }
 
-impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState for Http<Front, L> {
+impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> SessionState for Http<Front, L> {
     fn ready(
         &mut self,
         session: Rc<RefCell<dyn crate::ProxySession>>,

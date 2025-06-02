@@ -35,7 +35,9 @@ hex = { workspace = true }
 hpack = { workspace = true }
 idna = { workspace = true }
 kawa = { workspace = true }
+lazy_static = "1.4.0" # Added
 libc = { workspace = true }
+lru = "0.12" # Added for forward proxy caching
 memchr = { workspace = true }
 mio = { workspace = true, features = ["os-poll", "os-ext", "net"] }
 nom = { workspace = true, features = ["std"] }
@@ -55,9 +57,10 @@ slab = { workspace = true }
 socket2 = { workspace = true, features = ["all"] }
 thiserror = { workspace = true }
 time = { workspace = true }
+url = "2.5.0" # Added
 
 sozu-command-lib = { workspace = true }
-lru = "0.12" # Added for forward proxy caching
+
 
 [dev-dependencies]
 quickcheck = { workspace = true }

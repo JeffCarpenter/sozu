@@ -168,6 +168,7 @@ impl SocketHandler for TcpStream {
     }
 }
 
+#[derive(Debug)]
 pub struct FrontRustls {
     pub stream: TcpStream,
     pub session: ServerConnection,
