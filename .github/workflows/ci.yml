@@ -20,22 +20,28 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Checkout sources
         uses: actions/checkout@v4
-      - name: Install rust (${{ matrix.rust }})
-        uses: actions-rs/toolchain@v1
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
         with:
-          toolchain: ${{ matrix.rust }}
-          profile: minimal
-          override: true
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Install Clippy
+        run: rustup component add clippy
+      - name: Run cargo clippy --fix (check for unapplied lints)
+        run: |
+          cargo clippy --all-targets --all-features -- -D warnings --fix --allow-dirty --allow-staged
+          git diff --exit-code
       - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: ${{ matrix.features }}
+        run: cargo build ${{ matrix.features }}
       - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --verbose ${{ matrix.features }}
+        run: cargo test --verbose ${{ matrix.features }}
   doc:
     name: Build documentation
     runs-on: ubuntu-latest
@@ -44,17 +50,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Checkout sources
         uses: actions/checkout@v4
-      - name: Install rust
-        uses: actions-rs/toolchain@v1
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
         with:
-          toolchain: stable
-          profile: minimal
-          override: true
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
       - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: doc
-          args: --verbose
+        run: cargo doc --verbose
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
@@ -63,40 +72,24 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Checkout sources
         uses: actions/checkout@v4
-      - name: Install rust
-        uses: actions-rs/toolchain@v1
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
         with:
-          toolchain: stable
-          profile: minimal
-          override: true
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
       - name: Install cargo-tarpaulin
-        uses: actions-rs/cargo@v1
-        with:
-          command: install
-          args: cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
       - name: Run cargo tarpaulin
-        uses: actions-rs/cargo@v1
         env:
           TOKEN: ${{ secrets.COVERALLS_TOKEN }}
-        with:
-          command: tarpaulin
-          args: --coveralls $TOKEN
-  dockerhub:
-    name: Docker build and push to Docker Hub
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: 'true'
-          tags: clevercloud/sozu:${{ github.sha }}
+        run: cargo tarpaulin --coveralls $TOKEN
   test-windows:
     name: Test on Windows
     runs-on: windows-latest
@@ -115,19 +108,20 @@ jobs:
           protoc --version
       - name: Checkout sources
         uses: actions/checkout@v4
-      - name: Install rust (stable)
-        uses: actions-rs/toolchain@v1
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
         with:
-          toolchain: stable
-          profile: minimal
-          override: true
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
       - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
+        run: cargo build
       - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --verbose
+        run: cargo test --verbose
 ...

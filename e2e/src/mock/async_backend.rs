@@ -1,15 +1,16 @@
 use std::{
-        fs::File,
-        io::{BufReader, ErrorKind, Read, Write},
+        io::{ErrorKind, Read, Write as IoWrite}, // Renamed Write to IoWrite to avoid conflict
     net::{SocketAddr, TcpListener, TcpStream},
     str::from_utf8_unchecked,
         sync::Arc, // For Arc<TlsAcceptor>
     thread,
+        path::PathBuf, // To work with temp file paths
 };
 
 use futures::channel::mpsc;
-    // Assuming native_tls is added to e2e/Cargo.toml
-    use native_tls::{Identity, TlsAcceptor, TlsStream}; 
+    use native_tls::{Identity, TlsAcceptor, TlsStream};
+    use rcgen::{CertificateParams, KeyPair, SanType, DistinguishedName, Certificate}; // Added Certificate
+    use tempfile::NamedTempFile; // For temporary certificate files
 
 use crate::{
     http_utils::http_ok_response,
@@ -17,9 +18,38 @@ use crate::{
     BUFFER_SIZE,
 };
 
-    // Placeholder for where certs might be. User needs to ensure these exist.
-    const MOCK_CERT_PATH: &str = "e2e/mock_cert.pem"; // Or a path accessible by the test runner
-    const MOCK_KEY_PATH: &str = "e2e/mock_key.p8";   // PKCS#8 format typically
+// Helper to generate cert/key PEM strings
+fn internal_generate_cert_key_pems(subject_alt_names: Vec<String>) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let mut params = CertificateParams::new(subject_alt_names.clone());
+    params.distinguished_name = DistinguishedName::new();
+    params.distinguished_name.push(rcgen::DnType::CommonName, subject_alt_names.get(0).map_or("mockserver.test", |s| s).to_string()); // Use first SAN as CN or default
+    // Add all provided SANs
+    for san in subject_alt_names {
+        // rcgen figures out if it's IP or DNS name based on parsing
+        params.subject_alt_names.push(SanType::GeneralName(rcgen::GeneralName::from(san)));
+    }
+
+
+    let cert = Certificate::from_params(params)?;
+    let cert_pem = cert.pem()?;
+    let key_pem = cert.key_pair().serialize_pem();
+    Ok((cert_pem, key_pem))
+}
+
+/// Generates a self-signed certificate and private key, saving them to temporary files.
+/// Returns paths to the temporary cert and key files.
+pub fn generate_temp_cert_key_files(subject_alt_names: Vec<String>) -> Result<(NamedTempFile, NamedTempFile), Box<dyn std::error::Error>> {
+    let (cert_pem, key_pem) = internal_generate_cert_key_pems(subject_alt_names)?;
+
+    let mut cert_file = NamedTempFile::new()?;
+    cert_file.write_all(cert_pem.as_bytes())?;
+
+    let mut key_file = NamedTempFile::new()?;
+    key_file.write_all(key_pem.as_bytes())?;
+
+    Ok((cert_file, key_file))
+}
+
 
 /// Handle to a detached thread where a Backend runs
 /// (a thin wrapper around a TcpListener)
@@ -44,12 +74,12 @@ impl<A: Aggregator + Send + Sync + 'static> BackendHandle<A> {
         let name = name.into();
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
         let (mut aggregator_tx, aggregator_rx) = mpsc::channel::<A>(1);
-        
+
         // Use specific_address if provided, otherwise use the dynamically assigned one from setup.
         // The 'address' parameter in this function signature is usually the one from sozu config,
         // which might be dynamic for backends. For a mock *target* server, we need a fixed one.
         let bind_addr = specific_address.unwrap_or(address);
-        
+
         let listener = TcpListener::bind(bind_addr).expect(&format!("could not bind to address: {}", bind_addr));
         let actual_address = listener.local_addr().expect("Failed to get local address from listener");
         println!("Mock backend '{}' attempting to listen on {}, actually listening on {}", name, bind_addr, actual_address);
@@ -233,7 +263,7 @@ impl BackendHandle<VerifyingAggregator> {
                         }
                     }
                     // Reset host header for each new request check
-                    aggregator.last_host_header = None; 
+                    aggregator.last_host_header = None;
                     let header_lines = request_str.lines().skip(1); // Skip request line
                     for line in header_lines {
                         if line.to_lowercase().starts_with("host:") {
@@ -243,7 +273,7 @@ impl BackendHandle<VerifyingAggregator> {
                             break;
                         }
                     }
-                    
+
                     let body_parts: Vec<&str> = request_str.split("\r\n\r\n").collect();
                     if body_parts.len() > 1 && !body_parts[1].is_empty() {
                         aggregator.last_body = Some(body_parts[1..].join("\r\n\r\n"));
@@ -257,7 +287,7 @@ impl BackendHandle<VerifyingAggregator> {
                     } else {
                         panic!("{}: Failed to parse method from request", backend_name);
                     }
-                    
+
                     if let Some(ref path) = aggregator.last_path {
                          assert!(path.starts_with(&expected_path_prefix), "{}: Path prefix mismatch. Expected prefix: '{}', Got: '{}'", backend_name, expected_path_prefix, path);
                         // Increment hit count for this path
@@ -269,7 +299,7 @@ impl BackendHandle<VerifyingAggregator> {
                     if !expected_host_header.is_empty() { // Allow skipping host check if empty expected_host_header
                         assert_eq!(aggregator.last_host_header.as_ref(), Some(&expected_host_header), "{}: Host header mismatch", backend_name);
                     }
-                    
+
                     aggregator.requests_received += 1;
 
                     let mut response_headers_str = format!("Content-Length: {}\r\nConnection: close\r\n", response_body.len());
@@ -371,7 +401,7 @@ impl BackendHandle<VerifyingAggregator> {
                              if !expected_host_header_inner.is_empty() {
                                 assert_eq!(aggregator.last_host_header.as_ref(), Some(&expected_host_header_inner), "{}: Inner host header mismatch", backend_name);
                             }
-                            
+
                             aggregator.requests_received += 1;
 
                             let response = format!(
@@ -405,52 +435,36 @@ impl BackendHandle<VerifyingAggregator> {
     }
 }
 
-// Helper to load PKCS#8 key and PEM certificate for native-tls
-// This would ideally be in a shared test utils module.
-pub fn load_server_identity() -> Result<Identity, Box<dyn std::error::Error>> {
-    // This is a placeholder for actual key loading.
-    // In a real test environment, you'd read these from files.
-    // For now, to make it somewhat runnable without external files,
-    // I'll use dummy byte arrays. These WON'T WORK for real TLS.
-    // Replace with actual file loading:
-    // let key_file = File::open(MOCK_KEY_PATH)?;
-    // let mut key_reader = BufReader::new(key_file);
-    // let mut key_bytes = Vec::new();
-    // key_reader.read_to_end(&mut key_bytes)?;
-    //
-    // let cert_file = File::open(MOCK_CERT_PATH)?;
-    // let mut cert_reader = BufReader::new(cert_file);
-    // let mut cert_bytes = Vec::new();
-    // cert_reader.read_to_end(&mut cert_bytes)?;
-    // Identity::from_pkcs8(&cert_bytes, &key_bytes)
-    
-    // Using hardcoded dummy identity for placeholder. This will fail handshake.
-    // User must replace MOCK_CERT_PATH and MOCK_KEY_PATH and use file loading code above.
-    println!("WARN: Using dummy TLS identity for mock server. Real cert/key needed for CONNECT tests to pass TLS handshake.");
-    println!("Please ensure '{}' (PEM cert) and '{}' (PKCS#8 key) exist or update paths.", MOCK_CERT_PATH, MOCK_KEY_PATH);
-    
-    // Attempt to load real files if they exist, otherwise use a dummy that will likely fail.
-    match (File::open(MOCK_CERT_PATH), File::open(MOCK_KEY_PATH)) {
-        (Ok(cert_file), Ok(key_file)) => {
-            let mut cert_reader = BufReader::new(cert_file);
-            let mut cert_bytes = Vec::new();
-            cert_reader.read_to_end(&mut cert_bytes)?;
+// Helper to load PKCS#8 key and PEM certificate for native-tls using temporary file paths.
+// The NamedTempFile objects must be kept in scope by the caller for the duration these paths are needed.
+pub fn load_server_identity_from_temp_files(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path
+) -> Result<Identity, Box<dyn std::error::Error>> {
+    println!("Loading TLS identity from temp files: cert='{}', key='{}'", cert_path.display(), key_path.display());
 
-            let mut key_reader = BufReader::new(key_file);
-            let mut key_bytes = Vec::new();
-            key_reader.read_to_end(&mut key_bytes)?;
-            
-            println!("Successfully loaded mock certificate and key from files.");
-            Identity::from_pkcs8(&cert_bytes, &key_bytes).map_err(|e| e.into())
-        }
-        _ => {
-            // Fallback dummy identity if files are not found - this will cause TLS errors.
-            // Generate a temporary self-signed cert/key for basic structure testing if possible,
-            // but native-tls Identity::from_pkcs8 needs valid data.
-            // This dummy identity is invalid.
-            let dummy_key = b"-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC7g+kYj4N2\n-----END PRIVATE KEY-----"; // Invalid dummy
-            let dummy_cert = b"-----BEGIN CERTIFICATE-----\nMIIEajCCAuKgAwIBAgIJAOsrGj+P74d5MA0GCSqGSIb3DQEBCwUAMFExCzAJ\n-----END CERTIFICATE-----"; // Invalid dummy
-            Identity::from_pkcs8(dummy_cert, dummy_key).map_err(|e| e.into())
-        }
-    }
+    let mut cert_file = std::fs::File::open(cert_path)?;
+    let mut cert_pem_bytes = Vec::new();
+    cert_file.read_to_end(&mut cert_pem_bytes)?;
+
+    let mut key_file = std::fs::File::open(key_path)?;
+    let mut key_pem_bytes = Vec::new();
+    key_file.read_to_end(&mut key_pem_bytes)?;
+
+    // Convert PEM to DER for Identity::from_pkcs8
+    // Certificate part
+    let cert_pem_str = String::from_utf8(cert_pem_bytes)?;
+    let cert_der = rcgen::Certificate::from_pem(&cert_pem_str)?.der().to_vec();
+
+    // Key part (PKCS#8 PEM to PKCS#8 DER)
+    let key_pem_str = String::from_utf8(key_pem_bytes)?;
+    let key_der = KeyPair::from_pem(&key_pem_str)?.serialize_pkcs8_der();
+
+    Identity::from_pkcs8(&cert_der, &key_der).map_err(|e| e.into())
 }
+
+// Renamed the original function that returned PEM strings.
+// This is now an internal helper.
+// pub fn generate_cert_key_pem(subject_alt_names: Vec<String>) -> Result<(String, String), Box<dyn std::error::Error>> {
+// ... this is now internal_generate_cert_key_pems ...
+// }

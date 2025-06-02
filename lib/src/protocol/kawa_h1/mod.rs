@@ -199,10 +199,18 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     // --- End of Fields for Forward Proxy support ---
 
     // --- Fields for Caching ---
-    serving_from_cache: Option<CachedResponse>,
+    // serving_from_cache: Option<CachedResponse>, // Replaced by current_cached_response_to_serve
     // Store the cache key for the current request if it's cacheable,
     // so we can use it when populating the cache after fetching from origin.
-    current_cache_key: Option<CacheKey>, 
+    current_cache_key: Option<CacheKey>,
+    // New fields for managing state of serving a cached response
+    current_cached_response_to_serve: Option<CachedResponse>,
+    cached_response_headers_sent: bool,
+    cached_response_body_bytes_written: usize,
+    // Temporary buffer for constructing and sending cached response headers + part of body
+    // This is to handle cases where headers + initial body chunk might be sent together.
+    // Or simply, manage header sending state separately.
+    // Let's try with just the headers_sent flag and body_bytes_written first.
     // --- End of Fields for Caching ---
 }
 
@@ -302,8 +310,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             is_connect_tunnel: false,
             connect_response_buffer: None,
             // Init cache fields
-            serving_from_cache: None,
+            // serving_from_cache: None, // Replaced
             current_cache_key: None,
+            current_cached_response_to_serve: None,
+            cached_response_headers_sent: false,
+            cached_response_body_bytes_written: 0,
         })
     }
 
@@ -326,8 +337,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.is_connect_tunnel = false; // Should already be false if not in a tunnel
         self.connect_response_buffer = None;
         // Reset cache fields
-        self.serving_from_cache = None;
+        // self.serving_from_cache = None; // Replaced
         self.current_cache_key = None;
+        self.current_cached_response_to_serve = None;
+        self.cached_response_headers_sent = false;
+        self.cached_response_body_bytes_written = 0;
 
 
         self.request_stream.clear();
@@ -469,7 +483,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         // --- BEGIN CACHING LOOKUP ---
         // Only attempt cache lookup if not already serving from cache, not in tunnel mode, and is GET.
-        if self.serving_from_cache.is_none() && !self.is_connect_tunnel && self.context.method == Some(Method::Get) {
+        if self.current_cached_response_to_serve.is_none() && !self.is_connect_tunnel && self.context.method == Some(Method::Get) {
             // Simplified Cache-Control check (client headers)
             let mut bypass_cache = false;
             for (name, value) in self.request_stream.detached.headers.iter() {
@@ -515,14 +529,16 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     if let Ok(mut cache) = HTTP_FORWARD_CACHE.lock() {
                         if let Some(cached_item) = cache.get(&key) {
                             info!("{} Cache HIT for key: {}", log_context!(self), key);
-                            self.serving_from_cache = Some(cached_item.clone());
+                            self.current_cached_response_to_serve = Some(cached_item.clone());
+                            self.cached_response_headers_sent = false;
+                            self.cached_response_body_bytes_written = 0;
                             // Bypassing further request processing and backend connection.
                             // Ensure writable() will be called to serve this.
                             self.frontend_readiness.interest.insert(Ready::WRITABLE);
                             // No need to read further from client for this request.
-                            self.frontend_readiness.interest.remove(Ready::READABLE); 
+                            self.frontend_readiness.interest.remove(Ready::READABLE);
                             // Clear events that might have been processed before this point in the loop
-                            self.frontend_readiness.event = Ready::EMPTY; 
+                            self.frontend_readiness.event = Ready::EMPTY;
                             self.backend_readiness.event = Ready::EMPTY;
                             return StateResult::Continue; // Let writable() handle it.
                         } else {
@@ -542,9 +558,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         if !self.is_forward_proxy_request && // Not already marked by CONNECT
            (self.request_stream.is_header_phase() || self.request_stream.is_main_phase()) {
 
-            let can_be_absolute_uri_forward = 
+            let can_be_absolute_uri_forward =
                 // Condition 1: No cluster was assigned by router (implicit forward proxy mode)
-                self.context.cluster_id.is_none() || 
+                self.context.cluster_id.is_none() ||
                 // Condition 2: Or, it's an HTTP/0.9-like simple request where authority might be missing
                 // and path IS the absolute URI. (This part is more speculative for Sozu's typical use)
                 (self.context.authority.is_none() && self.context.path.as_ref().map_or(false, |p| p.contains("://")));
@@ -564,7 +580,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         Ok(parsed_url) => {
                             let scheme = parsed_url.scheme().to_lowercase();
                             if (scheme == "http" || scheme == "https") && parsed_url.host_str().is_some() {
-                                info!("{} Possible absolute URI forward detected (cluster_id: {:?}, authority: {:?}). Original path: {}", 
+                                info!("{} Possible absolute URI forward detected (cluster_id: {:?}, authority: {:?}). Original path: {}",
                                     log_context!(self), self.context.cluster_id, self.context.authority, request_path_str);
 
                                 self.is_forward_proxy_request = true; // Mark as forward proxy request
@@ -624,7 +640,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         if !self.is_forward_proxy_request && // Not already identified as absolute URI forward
            (self.request_stream.is_header_phase() || self.request_stream.is_main_phase()) &&
            self.context.method == Some(Method::Connect) {
-            
+
             info!("{} CONNECT request detected.", log_context!(self));
             self.is_forward_proxy_request = true; // Mark that we are handling a forward proxy style request
 
@@ -643,7 +659,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         }
                     } else {
                         // Default to 443 for CONNECT if no port is specified
-                        self.forward_target_port = Some(443); 
+                        self.forward_target_port = Some(443);
                         info!("{} No port in CONNECT authority '{}', defaulting to 443.", log_context!(self), authority_str);
                     }
                     self.forward_target_scheme = Some("tcp".to_string()); // Scheme is implicitly tcp for the tunnel
@@ -724,7 +740,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 // Sozu tries to connect only once all the headers were gathered and edited
                 // this could be improved
                 // If serving from cache, we don't connect to backend.
-                if self.serving_from_cache.is_some() {
+                if self.current_cached_response_to_serve.is_some() {
                     trace!("{} Serving from cache, skipping backend connection.", log_context!(self));
                             self.frontend_readiness.interest.insert(Ready::WRITABLE); // Ensure writable to serve from cache
                 } else {
@@ -761,6 +777,150 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     pub fn writable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
         trace!("{} ============== writable", log_context!(self));
+
+        // --- BEGIN CACHING (Serve from cache with partial write handling) ---
+        // This logic confirms and refines the stateful approach to serving cached responses,
+        // ensuring partial writes of the body are handled by retaining state and continuing on subsequent calls.
+        // The item is taken from self.current_cached_response_to_serve.
+        // If not fully sent due to WouldBlock, it's put back.
+        // If an error occurs, it's dropped and state is reset.
+        // If fully sent, it's consumed and state is reset.
+        if self.current_cached_response_to_serve.is_some() {
+            // Take ownership of the cached item. It's put back if not fully sent and no fatal error.
+            if let Some(cached_item) = self.current_cached_response_to_serve.take() { // Renamed for clarity
+
+                // Phase 1: Send headers if not already sent
+                if !self.cached_response_headers_sent {
+                    let mut header_string = format!("HTTP/1.1 {}\r\n", cached_item.status);
+                    let mut content_length_present = false;
+                    let mut transfer_encoding_chunked = false;
+                    for (name, value) in &cached_item.headers {
+                        header_string.push_str(&format!("{}: {}\r\n", name, value));
+                        if name.eq_ignore_ascii_case("Content-Length") { content_length_present = true; }
+                        if name.eq_ignore_ascii_case("Transfer-Encoding") && value.eq_ignore_ascii_case("chunked") { transfer_encoding_chunked = true; }
+                    }
+                    if !cached_item.body.is_empty() && !content_length_present && !transfer_encoding_chunked {
+                        header_string.push_str(&format!("Content-Length: {}\r\n", cached_item.body.len()));
+                    }
+                    header_string.push_str("\r\n");
+
+                    let header_bytes = header_string.as_bytes();
+                    let (header_write_size, header_socket_state) = self.frontend_socket.socket_write_vectored(&[std::io::IoSlice::new(header_bytes)]);
+
+                    match header_socket_state {
+                        SocketResult::Error | SocketResult::Closed => {
+                            self.frontend_socket.write_error();
+                            self.log_request_error(metrics, "Front socket error/closed while writing cached headers.");
+                            self.cached_response_headers_sent = false; // Reset state
+                            self.cached_response_body_bytes_written = 0;
+                            // current_cached_response_to_serve already taken and not put back
+                            return StateResult::CloseSession;
+                        }
+                        SocketResult::WouldBlock => {
+                            self.frontend_readiness.event.remove(Ready::WRITABLE);
+                            self.current_cached_response_to_serve = Some(cached_item); // Put it back, headers not sent
+                            return StateResult::Continue;
+                        }
+                        SocketResult::Continue => {
+                            if header_write_size < header_bytes.len() {
+                                // Partial header write is treated as an error for simplicity.
+                                error!("{} Partial write of cached headers ({} of {} bytes). Closing session.",
+                                    log_context!(self), header_write_size, header_bytes.len());
+                                self.log_request_error(metrics, "Partial write of cached headers");
+                                self.cached_response_headers_sent = false;
+                                self.cached_response_body_bytes_written = 0;
+                                return StateResult::CloseSession;
+                            }
+                            self.cached_response_headers_sent = true;
+                            info!("{} Successfully sent cached headers.", log_context!(self));
+                            // If body is empty, we are done after sending headers.
+                            if cached_item.body.is_empty() {
+                                // Fall through to Phase 3 completion logic directly.
+                            } else {
+                                // Headers sent, body is not empty. Put item back for body sending phase.
+                                self.current_cached_response_to_serve = Some(cached_item);
+                                self.frontend_readiness.interest.insert(Ready::WRITABLE); // Ensure writable for body
+                                return StateResult::Continue;
+                            }
+                        }
+                    }
+                }
+
+                // `cached_item` was taken at the start of the `if let Some...` block.
+                // If execution reaches here, it means either headers were just fully sent,
+                // or they were sent in a previous call.
+                // We need to use the `cached_item` that was taken.
+                let mut item_being_served = cached_item;
+
+
+                // Phase 2: Send body if headers have been successfully sent
+                if self.cached_response_headers_sent {
+                    if self.cached_response_body_bytes_written < item_being_served.body.len() {
+                        let body_slice_to_send = &item_being_served.body[self.cached_response_body_bytes_written..];
+
+                        if !body_slice_to_send.is_empty() {
+                            let (body_write_size, body_socket_state) = self.frontend_socket.socket_write_vectored(&[std::io::IoSlice::new(body_slice_to_send)]);
+
+                            if body_write_size > 0 {
+                                self.cached_response_body_bytes_written += body_write_size;
+                                count!("bytes_out", body_write_size as i64);
+                                metrics.bout += body_write_size;
+                            }
+
+                            match body_socket_state {
+                                SocketResult::Error | SocketResult::Closed => {
+                                    self.frontend_socket.write_error();
+                                    self.log_request_error(metrics, "Front socket error/closed while writing cached body.");
+                                    self.cached_response_headers_sent = false;
+                                    self.cached_response_body_bytes_written = 0;
+                                    return StateResult::CloseSession;
+                                }
+                                SocketResult::WouldBlock => {
+                                    self.frontend_readiness.event.remove(Ready::WRITABLE);
+                                    self.current_cached_response_to_serve = Some(item_being_served); // Put it back
+                                    return StateResult::Continue;
+                                }
+                                SocketResult::Continue => {
+                                    if self.cached_response_body_bytes_written < item_being_served.body.len() {
+                                        self.frontend_readiness.interest.insert(Ready::WRITABLE);
+                                        self.current_cached_response_to_serve = Some(item_being_served); // Put it back
+                                        return StateResult::Continue;
+                                    }
+                                    // Else, all body written, fall through to completion.
+                                }
+                            }
+                        }
+                    }
+
+                    // Phase 3: Check for completion (headers sent and all body bytes written)
+                    if self.cached_response_headers_sent && self.cached_response_body_bytes_written == item_being_served.body.len() {
+                        info!("{} Successfully served complete response from cache.", log_context!(self));
+                        self.log_request_success(metrics);
+
+                        let closing = self.context.closing || !self.context.keep_alive_frontend;
+                        // State (current_cached_response_to_serve, headers_sent, body_bytes_written)
+                        // will be fully reset by Http::reset() if keep-alive.
+
+                        if closing {
+                            return StateResult::CloseSession;
+                        } else {
+                            metrics.reset();
+                            self.reset();
+                            return StateResult::Continue;
+                        }
+                    }
+                }
+                // Fallback: If for some reason the item wasn't fully processed and not put back by an early return,
+                // ensure it's put back if there's still work to do.
+                if self.current_cached_response_to_serve.is_none() &&
+                   (!self.cached_response_headers_sent || self.cached_response_body_bytes_written < item_being_served.body.len()) {
+                     self.current_cached_response_to_serve = Some(item_being_served);
+                }
+                return StateResult::Continue;
+            }
+        }
+        // --- END CACHING (Serve from cache with partial write handling) ---
+
         let response_stream = match &mut self.response_stream {
             ResponseStream::BackendAnswer(response_stream) => {
                 // --- BEGIN CACHING (Population) ---
@@ -1714,18 +1874,18 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
         }
     }
-    
+
     /// Generic helper for transferring data in tunnel mode.
     /// Returns `Ok(true)` if EOF or error occurred on source/destination, indicating session should close.
     /// Returns `Ok(false)` if data was transferred or a socket would block (session continues).
     /// Returns `Err(_)` for critical internal errors (e.g., trying to use DefaultAnswer stream).
-    fn transfer_data<S1, S2>(&mut self, 
+    fn transfer_data<S1, S2>(&mut self,
         source_socket_handler: &mut S1, // Renamed to avoid conflict with Http.source_socket
         dest_socket_handler: &mut S2,   // Renamed to avoid conflict
-        buffer_checkout: &mut kawa::Buffer<Checkout>, 
-        metrics: &mut SessionMetrics, 
+        buffer_checkout: &mut kawa::Buffer<Checkout>,
+        metrics: &mut SessionMetrics,
         is_front_to_back: bool
-    ) -> Result<bool, ()> 
+    ) -> Result<bool, ()>
     where
         S1: SocketHandler + std::fmt::Debug,
         S2: SocketHandler + std::fmt::Debug,
@@ -1737,11 +1897,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             let (write_size, write_state) = dest_socket_handler.socket_write_vectored(&[std::io::IoSlice::new(buffer_checkout.used())]);
             if write_size > 0 {
                 buffer_checkout.consume(write_size);
-                if is_front_to_back { 
-                    metrics.backend_bout += write_size; count!("connect.front_to_back_bytes_written", write_size as i64); 
+                if is_front_to_back {
+                    metrics.backend_bout += write_size; count!("connect.front_to_back_bytes_written", write_size as i64);
                     trace!("{} CONNECT tunnel: Wrote {} bytes from client to target.", log_context!(self), write_size);
-                } else { 
-                    metrics.bout += write_size; count!("connect.back_to_front_bytes_written", write_size as i64); 
+                } else {
+                    metrics.bout += write_size; count!("connect.back_to_front_bytes_written", write_size as i64);
                     trace!("{} CONNECT tunnel: Wrote {} bytes from target to client.", log_context!(self), write_size);
                 }
             }
@@ -1761,11 +1921,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
              let (read_size, read_state) = source_socket_handler.socket_read(buffer_checkout.space());
              if read_size > 0 {
                 buffer_checkout.fill(read_size);
-                if is_front_to_back { 
-                    metrics.bin += read_size; count!("connect.front_to_back_bytes_read", read_size as i64); 
+                if is_front_to_back {
+                    metrics.bin += read_size; count!("connect.front_to_back_bytes_read", read_size as i64);
                     trace!("{} CONNECT tunnel: Read {} bytes from client.", log_context!(self), read_size);
-                } else { 
-                    metrics.backend_bin += read_size; count!("connect.back_to_front_bytes_read", read_size as i64); 
+                } else {
+                    metrics.backend_bin += read_size; count!("connect.back_to_front_bytes_read", read_size as i64);
                     trace!("{} CONNECT tunnel: Read {} bytes from target.", log_context!(self), read_size);
                 }
              }
@@ -1774,12 +1934,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 SocketResult::Error | SocketResult::Closed => { // EOF or error on source
                     let direction = if is_front_to_back { "source (client)" } else { "source (target)" };
                     info!("{} CONNECT tunnel: {} socket EOF/error/closed on read. Marking for session closure.", log_context!(self), direction);
-                    eof_or_error_occurred = true; 
+                    eof_or_error_occurred = true;
                 }
                 SocketResult::Continue => {}
             }
         }
-        
+
         Ok(eof_or_error_occurred)
     }
 
@@ -1802,12 +1962,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         Ok(should_close) => {
                             if should_close { close_session = true; break; }
                             activity_occured = true; // transfer_data would have returned false if it just blocked
-                        } 
+                        }
                         Err(_) => { close_session = true; break; } // Internal error from transfer_data itself
                     }
-                } else { 
+                } else {
                     info!("{} CONNECT tunnel: Backend socket missing for front->back transfer. Closing.", log_context!(self));
-                    close_session = true; break; 
+                    close_session = true; break;
                 }
             }
             if close_session { break; }
@@ -1828,13 +1988,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         }
                         Err(_) => { close_session = true; break; }
                     }
-                } else { 
+                } else {
                      info!("{} CONNECT tunnel: Backend socket missing for back->front transfer. Closing.", log_context!(self));
-                    close_session = true; break; 
+                    close_session = true; break;
                 }
             }
             if close_session { break; }
-            
+
             // If after trying both directions, no new events were processed by this iteration of the loop for readable,
             // and no data could be moved (e.g. both directions would block on write or read with empty buffers), then break.
             if !self.frontend_readiness.event.is_readable() && !self.backend_readiness.event.is_readable() && !activity_occured {
@@ -1851,7 +2011,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             info!("{} CONNECT tunnel: Backend HUP/Error detected post-transfer. Closing session.", log_context!(self));
             close_session = true;
         }
-        
+
         // Clear Mio events as they've been processed for this tunnel iteration
         self.frontend_readiness.event = Ready::EMPTY;
         self.backend_readiness.event = Ready::EMPTY;
@@ -1884,7 +2044,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             })?;
 
             let target_addr_str = format!("{}:{}", target_host, target_port);
-            
+
             // Close any existing backend connection if we're switching to a direct forward.
             // This mirrors logic for when cluster_id changes.
             if self.backend_token.take().is_some() {
@@ -2265,22 +2425,22 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             info!("{} TCP connection to target for CONNECT successful. Preparing '200 Connection established'.", log_context!(self));
             self.connect_response_buffer = Some(b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec());
             self.frontend_readiness.interest.insert(Ready::WRITABLE); // Ensure writable() is called to send this.
-            
+
             // Mark backend as "connected" for internal state management (e.g. timeouts)
             // This doesn't mean it's an HTTP backend in the traditional sense for CONNECT.
-            metrics.backend_connected(); 
+            metrics.backend_connected();
             self.connection_attempts = 0; // Reset for this connection
             self.set_backend_connected(BackendConnectionStatus::Connected, metrics); // Update status
-            
+
             // For CONNECT, after 200 OK, we don't do further HTTP processing on this connection.
             // So, remove interest in reading more from client (until tunnel starts) or writing to backend (HTTP-wise).
             self.frontend_readiness.interest.remove(Ready::READABLE);
-            self.backend_readiness.interest.remove(Ready::WRITABLE | Ready::READABLE); 
-            
+            self.backend_readiness.interest.remove(Ready::WRITABLE | Ready::READABLE);
+
             // Clear current events as we've handled the successful connection event for CONNECT.
             self.frontend_readiness.event = Ready::EMPTY;
             self.backend_readiness.event = Ready::EMPTY;
-            
+
             return SessionResult::Continue; // Let Http::writable send the 200 OK.
         }
         // --- END FORWARD PROXY (CONNECT Tunnel Handling Setup) ---

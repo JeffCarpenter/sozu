@@ -1671,17 +1671,17 @@ fn try_forward_proxy_cache_non_200_response() -> State {
     // 1. Start Mock Upstream Server (configured to send 404)
     let mut mock_upstream = BackendHandle::<VerifyingAggregator>::spawn_detached_backend(
         "MOCK_NON200_UPSTREAM".to_string(),
-        mock_upstream_addr, 
+        mock_upstream_addr,
         VerifyingAggregator::new(),
         BackendHandle::verifying_http_handler(
             "GET".to_string(),
             resource_path.clone(),
-            mock_upstream_addr_str.clone(), 
+            mock_upstream_addr_str.clone(),
             upstream_response_body.clone(),
             404, // Status code 404
-            None, 
+            None,
         ),
-        Some(mock_upstream_addr), 
+        Some(mock_upstream_addr),
     );
     info!("Mock non-200 upstream server started on {}", mock_upstream_addr);
 
@@ -1732,7 +1732,7 @@ fn try_forward_proxy_cache_non_200_response() -> State {
         }
         Err(e) => { eprintln!("Client: Failed to connect for second non-200 request: {}", e); return State::Fail; }
     }
-    
+
     // 3. Verification
     let aggregator_data = mock_upstream.stop_and_get_aggregator().expect("Failed to get aggregator data");
     info!("Mock upstream aggregator data for non-200 test: {:?}", aggregator_data);
@@ -1774,17 +1774,17 @@ fn try_forward_proxy_cache_non_get_request() -> State {
     // 1. Start Mock Upstream Server
     let mut mock_upstream = BackendHandle::<VerifyingAggregator>::spawn_detached_backend(
         "MOCK_NONGET_UPSTREAM".to_string(),
-        mock_upstream_addr, 
+        mock_upstream_addr,
         VerifyingAggregator::new(),
         BackendHandle::verifying_http_handler(
             "POST".to_string(), // Expecting POST
             resource_path.clone(),
-            mock_upstream_addr_str.clone(), 
+            mock_upstream_addr_str.clone(),
             upstream_response_body.clone(),
             200, // Or 201, depending on desired mock behavior for POST
-            None, 
+            None,
         ),
-        Some(mock_upstream_addr), 
+        Some(mock_upstream_addr),
     );
     info!("Mock non-GET upstream server started on {}", mock_upstream_addr);
 
@@ -1810,7 +1810,7 @@ fn try_forward_proxy_cache_non_get_request() -> State {
     match std::net::TcpStream::connect(sozu_front_addr) {
         Ok(mut stream) => {
             let request = format!(
-                "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", 
+                "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 absolute_uri, mock_upstream_addr_str, request_body.len(), request_body
             );
             stream.write_all(request.as_bytes()).expect("Client failed to send first POST request");
@@ -1829,7 +1829,7 @@ fn try_forward_proxy_cache_non_get_request() -> State {
     match std::net::TcpStream::connect(sozu_front_addr) {
         Ok(mut stream) => {
             let request = format!(
-                "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", 
+                "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 absolute_uri, mock_upstream_addr_str, request_body.len(), request_body
             );
             stream.write_all(request.as_bytes()).expect("Client failed to send second POST request");
@@ -1841,7 +1841,7 @@ fn try_forward_proxy_cache_non_get_request() -> State {
         }
         Err(e) => { eprintln!("Client: Failed to connect for second POST request: {}", e); return State::Fail; }
     }
-    
+
     // 3. Verification
     let aggregator_data = mock_upstream.stop_and_get_aggregator().expect("Failed to get aggregator data");
     info!("Mock upstream aggregator data for non-GET test: {:?}", aggregator_data);
@@ -1879,23 +1879,23 @@ fn try_forward_proxy_cache_control_server_max_age_0() -> State {
 
     let resource_path = "/noncacheable/max-age-0".to_string();
     let upstream_response_body = format!("Response for {} (should be immediately stale)", resource_path);
-    
+
     let custom_headers = Some(vec![("Cache-Control".to_string(), "max-age=0".to_string())]);
 
     // 1. Start Mock Upstream Server
     let mut mock_upstream = BackendHandle::<VerifyingAggregator>::spawn_detached_backend(
         "MOCK_CC_MAXAGE0_UPSTREAM".to_string(),
-        mock_upstream_addr, 
+        mock_upstream_addr,
         VerifyingAggregator::new(),
         BackendHandle::verifying_http_handler(
             "GET".to_string(),
             resource_path.clone(),
-            mock_upstream_addr_str.clone(), 
+            mock_upstream_addr_str.clone(),
             upstream_response_body.clone(),
             200,
-            custom_headers, 
+            custom_headers,
         ),
-        Some(mock_upstream_addr), 
+        Some(mock_upstream_addr),
     );
     info!("Mock CC max-age=0 upstream server started on {}", mock_upstream_addr);
 
@@ -1947,7 +1947,7 @@ fn try_forward_proxy_cache_control_server_max_age_0() -> State {
         }
         Err(e) => { eprintln!("Client: Failed to connect for second CC max-age=0 request: {}", e); return State::Fail; }
     }
-    
+
     // 3. Verification
     let aggregator_data = mock_upstream.stop_and_get_aggregator().expect("Failed to get aggregator data");
     info!("Mock upstream aggregator data for CC max-age=0 test: {:?}", aggregator_data);
@@ -1984,24 +1984,24 @@ fn try_forward_proxy_cache_control_server_no_store() -> State {
 
     let resource_path = "/noncacheable/no-store".to_string();
     let upstream_response_body = format!("Response for {} (should not be cached by Sozu)", resource_path);
-    
+
     // Configure mock server to send "Cache-Control: no-store"
     let custom_headers = Some(vec![("Cache-Control".to_string(), "no-store".to_string())]);
 
     // 1. Start Mock Upstream Server
     let mut mock_upstream = BackendHandle::<VerifyingAggregator>::spawn_detached_backend(
         "MOCK_CC_NOSTORE_UPSTREAM".to_string(),
-        mock_upstream_addr, 
+        mock_upstream_addr,
         VerifyingAggregator::new(),
         BackendHandle::verifying_http_handler(
             "GET".to_string(),
             resource_path.clone(),
-            mock_upstream_addr_str.clone(), 
+            mock_upstream_addr_str.clone(),
             upstream_response_body.clone(),
             200,
             custom_headers, // Send "Cache-Control: no-store"
         ),
-        Some(mock_upstream_addr), 
+        Some(mock_upstream_addr),
     );
     info!("Mock CC no-store upstream server started on {}", mock_upstream_addr);
 
@@ -2053,7 +2053,7 @@ fn try_forward_proxy_cache_control_server_no_store() -> State {
         }
         Err(e) => { eprintln!("Client: Failed to connect for second CC no-store request: {}", e); return State::Fail; }
     }
-    
+
     // 3. Verification
     let aggregator_data = mock_upstream.stop_and_get_aggregator().expect("Failed to get aggregator data");
     info!("Mock upstream aggregator data for CC no-store test: {:?}", aggregator_data);
@@ -2094,17 +2094,17 @@ fn try_forward_proxy_cache_control_client_no_cache() -> State {
     // 1. Start Mock Upstream Server
     let mut mock_upstream = BackendHandle::<VerifyingAggregator>::spawn_detached_backend(
         "MOCK_CC_NOCACHE_UPSTREAM".to_string(),
-        mock_upstream_addr, 
+        mock_upstream_addr,
         VerifyingAggregator::new(),
         BackendHandle::verifying_http_handler(
             "GET".to_string(),
             resource_path.clone(),
-            mock_upstream_addr_str.clone(), 
+            mock_upstream_addr_str.clone(),
             upstream_response_body.clone(),
             200,
-            None, 
+            None,
         ),
-        Some(mock_upstream_addr), 
+        Some(mock_upstream_addr),
     );
     info!("Mock CC no-cache upstream server started on {}", mock_upstream_addr);
 
@@ -2130,7 +2130,7 @@ fn try_forward_proxy_cache_control_client_no_cache() -> State {
     match std::net::TcpStream::connect(sozu_front_addr) {
         Ok(mut stream) => {
             let request = format!(
-                "GET {} HTTP/1.1\r\nHost: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n", 
+                "GET {} HTTP/1.1\r\nHost: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
                 absolute_uri, mock_upstream_addr_str
             );
             stream.write_all(request.as_bytes()).expect("Client failed to send first CC no-cache request");
@@ -2142,14 +2142,14 @@ fn try_forward_proxy_cache_control_client_no_cache() -> State {
         }
         Err(e) => { eprintln!("Client: Failed to connect for first CC no-cache request: {}", e); return State::Fail; }
     }
-    thread::sleep(Duration::from_millis(100)); 
+    thread::sleep(Duration::from_millis(100));
 
     // --- Second Request (with Cache-Control: no-cache) ---
     info!("Client: Sending second request with Cache-Control: no-cache to Sozu for {}", absolute_uri);
     match std::net::TcpStream::connect(sozu_front_addr) {
         Ok(mut stream) => {
             let request = format!(
-                "GET {} HTTP/1.1\r\nHost: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n", 
+                "GET {} HTTP/1.1\r\nHost: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
                 absolute_uri, mock_upstream_addr_str
             );
             stream.write_all(request.as_bytes()).expect("Client failed to send second CC no-cache request");
@@ -2161,7 +2161,7 @@ fn try_forward_proxy_cache_control_client_no_cache() -> State {
         }
         Err(e) => { eprintln!("Client: Failed to connect for second CC no-cache request: {}", e); return State::Fail; }
     }
-    
+
     // 3. Verification
     let aggregator_data = mock_upstream.stop_and_get_aggregator().expect("Failed to get aggregator data");
     info!("Mock upstream aggregator data for CC no-cache test: {:?}", aggregator_data);
@@ -2205,19 +2205,19 @@ fn try_forward_proxy_cache_miss_different_resource() -> State {
     // The same handler will be used, it will differentiate by path.
     let mut mock_upstream = BackendHandle::<VerifyingAggregator>::spawn_detached_backend(
         "MOCK_CACHE_MISS_UPSTREAM".to_string(),
-        mock_upstream_addr, 
+        mock_upstream_addr,
         VerifyingAggregator::new(), // Fresh aggregator
         BackendHandle::verifying_http_handler(
             "GET".to_string(), // Method applies to all requests for this handler instance
             "/cacheable/".to_string(), // Path prefix to match both resources
-            mock_upstream_addr_str.clone(), 
+            mock_upstream_addr_str.clone(),
             String::new(), // Response body will be set dynamically by path (not really, handler sends fixed body)
                            // For this test, the body check is less important than hit counts.
                            // We will rely on the fact that the handler sends *some* 200 OK.
             200,
-            None, 
+            None,
         ),
-        Some(mock_upstream_addr), 
+        Some(mock_upstream_addr),
     );
     info!("Mock cache miss upstream server started on {}", mock_upstream_addr);
 
@@ -2271,7 +2271,7 @@ fn try_forward_proxy_cache_miss_different_resource() -> State {
         }
         Err(e) => { eprintln!("Client: Failed to connect for Resource B request: {}", e); return State::Fail; }
     }
-    
+
     // 3. Verification
     let aggregator_data = mock_upstream.stop_and_get_aggregator().expect("Failed to get aggregator data");
     info!("Mock upstream aggregator data for cache miss test: {:?}", aggregator_data);
@@ -2304,28 +2304,36 @@ fn try_forward_proxy_connect_https() -> State {
     let mock_upstream_addr_str = format!("127.0.0.1:{}", provide_port());
     let mock_upstream_addr: SocketAddr = mock_upstream_addr_str.parse().expect("Failed to parse mock upstream address");
     let mock_upstream_host_for_connect = mock_upstream_addr_str.clone(); // Used in CONNECT request line
-    // This domain *must* match the CN or a SAN in the mock server's certificate.
-    let mock_upstream_domain_for_tls = "mockserver.test".to_string(); 
+    // This domain *must* match a SAN in the dynamically generated certificate.
+    let mock_upstream_domain_for_tls = "localhost".to_string(); // Using "localhost" as a SAN
 
     let sozu_front_addr_str = format!("127.0.0.1:{}", provide_port());
     let sozu_front_addr: SocketAddr = sozu_front_addr_str.parse().expect("Failed to parse Sozu front address");
 
-    // 1. Prepare TLS Acceptor for Mock Upstream Server
-    let identity = match crate::mock::async_backend::load_server_identity() {
+    // 1. Generate Temporary Cert/Key and Prepare TLS Acceptor for Mock Upstream Server
+    let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    let (cert_file_temp, key_file_temp) =
+        crate::mock::async_backend::generate_temp_cert_key_files(subject_alt_names)
+            .expect("Failed to generate temporary cert/key files");
+
+    let identity = match crate::mock::async_backend::load_server_identity_from_temp_files(
+        cert_file_temp.path(), key_file_temp.path()
+    ) {
         Ok(id) => id,
         Err(e) => {
-            eprintln!("CRITICAL: Failed to load server identity for mock TLS server: {}. This test requires mock_cert.pem and mock_key.p8 to be present in e2e/ (or paths updated in async_backend.rs). Cannot proceed.", e);
-            // This is a critical setup failure.
-            return State::Fail; 
+            eprintln!("CRITICAL: Failed to load server identity from temp files: {}. Cannot proceed.", e);
+            return State::Fail;
         }
     };
-    let acceptor = Arc::new(native_tls::TlsAcceptor::new(identity).expect("Failed to create TlsAcceptor"));
+    let acceptor = Arc::new(native_tls::TlsAcceptor::new(identity).expect("Failed to create TlsAcceptor from dynamic cert"));
+
+    // NamedTempFile objects (cert_file_temp, key_file_temp) must remain in scope until mock_upstream is done.
 
     // 2. Start Mock Upstream Server (with TLS handling)
     let expected_inner_method = "GET".to_string();
     let expected_inner_path = "/securepage".to_string();
     // Host header for the *inner* request, after TLS tunnel is established.
-    let expected_inner_host = mock_upstream_domain_for_tls.clone(); 
+    let expected_inner_host = mock_upstream_domain_for_tls.clone();
     let upstream_inner_response_body = "Hello from secure upstream via CONNECT!".to_string();
     let upstream_inner_response_status = 200;
 
@@ -2376,7 +2384,7 @@ fn try_forward_proxy_connect_https() -> State {
     };
 
     let connect_request = format!(
-        "CONNECT {0} HTTP/1.1\r\nHost: {0}\r\nConnection: Keep-Alive\r\n\r\n", 
+        "CONNECT {0} HTTP/1.1\r\nHost: {0}\r\nConnection: Keep-Alive\r\n\r\n",
         // Using Keep-Alive to hold the connection for TLS
         mock_upstream_host_for_connect // This is <mock_ip>:<mock_port>
     );
@@ -2432,7 +2440,7 @@ fn try_forward_proxy_connect_https() -> State {
         Err(e) => {
             eprintln!("Client: TLS handshake failed: {}", e);
             // Check if this failure was expected due to dummy certs
-            if format!("{}",e).contains("invalid certificate") && 
+            if format!("{}",e).contains("invalid certificate") &&
                crate::mock::async_backend::load_server_identity().is_err() {
                 info!("TLS handshake failed as expected due to dummy/invalid identity in mock server.");
                 worker.soft_stop(); worker.wait_for_server_stop();
@@ -2473,7 +2481,7 @@ fn try_forward_proxy_connect_https() -> State {
         }
         info!("Client: Read inner HTTPS response with error (likely unclean disconnect, will check buffer): {}", e);
     }
-    
+
     let inner_response_str = String::from_utf8_lossy(&inner_response_buffer);
     info!("Client: Received inner HTTPS response ({} bytes):\n{}", inner_response_buffer.len(), inner_response_str.trim());
 
@@ -2496,7 +2504,7 @@ fn try_forward_proxy_connect_https() -> State {
     // Mock Server Verification
     let aggregator_data = mock_upstream.stop_and_get_aggregator().expect("Failed to get aggregator data for TLS mock");
     info!("Mock TLS upstream aggregator data: {:?}", aggregator_data);
-    
+
     // This state is for when dummy certs are used, and the handshake fails, so no request reaches upstream.
     let using_dummy_certs_and_handshake_failed = crate::mock::async_backend::load_server_identity().is_err() && aggregator_data.requests_received == 0;
 
@@ -2528,7 +2536,7 @@ fn try_forward_proxy_connect_https() -> State {
 fn test_forward_proxy_connect_https() {
     assert_eq!(
         repeat_until_error_or(1, "Forward Proxy CONNECT HTTPS", try_forward_proxy_connect_https),
-        State::Success 
+        State::Success
         // Note: This might return Undecided if dummy certs are used and handshake fails.
         // For a real CI, this should be State::Success and use valid (though test-only) certs.
     );
@@ -2552,7 +2560,7 @@ fn try_forward_proxy_absolute_uri() -> State {
     let expected_method = "GET".to_string();
     let expected_path = "/test/path".to_string();
     // For absolute URI, the Host header sent by Sozu to upstream should match the URI's authority.
-    let expected_host = mock_upstream_addr_str.clone(); 
+    let expected_host = mock_upstream_addr_str.clone();
     let upstream_response_body = "Hello from upstream!".to_string();
     let upstream_response_status = 200;
 
@@ -2588,7 +2596,7 @@ fn try_forward_proxy_absolute_uri() -> State {
     }));
     worker.read_to_last(); // Process commands
     info!("Sozu worker started, listening on {}", sozu_front_addr);
-    
+
     // Give Sozu a moment to fully activate listener
     thread::sleep(Duration::from_millis(200));
 
@@ -2597,7 +2605,7 @@ fn try_forward_proxy_absolute_uri() -> State {
     let absolute_uri = format!("http://{}/test/path", mock_upstream_addr_str);
     let request_to_sozu = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        absolute_uri, 
+        absolute_uri,
         mock_upstream_addr_str // Host header should also match the URI's authority for forward proxy
     );
 
@@ -2647,7 +2655,7 @@ fn try_forward_proxy_absolute_uri() -> State {
             return State::Fail;
         }
     }
-    
+
     // 4. Verification via Mock Upstream Aggregator
     let aggregator_data = mock_upstream.stop_and_get_aggregator().expect("Failed to get aggregator data");
     info!("Mock upstream aggregator data: {:?}", aggregator_data);
@@ -2655,7 +2663,7 @@ fn try_forward_proxy_absolute_uri() -> State {
     assert_eq!(aggregator_data.requests_received, 1, "Mock upstream should have received 1 request.");
     assert_eq!(aggregator_data.last_method.as_ref(), Some(&expected_method), "Method mismatch at upstream.");
     // Sozu should forward the path part of the absolute URI
-    assert_eq!(aggregator_data.last_path.as_ref(), Some(&expected_path), "Path mismatch at upstream."); 
+    assert_eq!(aggregator_data.last_path.as_ref(), Some(&expected_path), "Path mismatch at upstream.");
     assert_eq!(aggregator_data.last_host_header.as_ref(), Some(&expected_host), "Host header mismatch at upstream.");
 
     // 5. Cleanup
@@ -2695,7 +2703,7 @@ fn try_forward_proxy_cache_hit() -> State {
     // 1. Start Mock Upstream Server
     let mut mock_upstream = BackendHandle::<VerifyingAggregator>::spawn_detached_backend(
         "MOCK_CACHE_UPSTREAM".to_string(),
-        mock_upstream_addr, 
+        mock_upstream_addr,
         VerifyingAggregator::new(),
         BackendHandle::verifying_http_handler(
             "GET".to_string(),
@@ -2705,7 +2713,7 @@ fn try_forward_proxy_cache_hit() -> State {
             200,
             None, // No special response headers from upstream for this test
         ),
-        Some(mock_upstream_addr), 
+        Some(mock_upstream_addr),
     );
     info!("Mock cache upstream server started on {}", mock_upstream_addr);
 
